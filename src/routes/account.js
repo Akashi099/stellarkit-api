@@ -19,7 +19,6 @@ const { Asset } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { getAssetMetadataFromToml } = require("../utils/tomlResolver");
 const { formatBalance } = require("../utils/formatBalance");
-const { validateAccountId, validateAssetCode } = require("../utils/validators");
 const { validateEffectType } = require("../utils/effectTypes");
 
 // Cache TTL for account endpoint responses (in seconds)
@@ -345,6 +344,57 @@ router.get("/:id/signing-keys", async (req, res, next) => {
 
     const account = await server.loadAccount(id);
     return success(res, normalizeSigningKeysResponse(account));
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/delegated-signers
+ * Returns additional account signers and whether each signer account is multisig.
+ */
+router.get("/:id/delegated-signers", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await server.loadAccount(id);
+    const delegatedSigners = (account.signers || []).filter(
+      (signer) =>
+        signer.key !== account.id &&
+        (!signer.type || normalizeSignerType(signer.type) === "ed25519_public_key"),
+    );
+
+    const resolvedSigners = await Promise.all(
+      delegatedSigners.map(async (signer) => {
+        const signerAccount = await server.loadAccount(signer.key);
+        const signerEntries = signerAccount.signers || [];
+        const masterSigner = signerEntries.find(
+          (entry) => entry.key === signerAccount.id,
+        );
+        const masterWeight = Number(
+          masterSigner?.weight ?? signerAccount.master_weight ?? 0,
+        );
+        const thresholds = signerAccount.thresholds || {};
+        const isMultisig =
+          signerEntries.length > 1 ||
+          Number(thresholds.low_threshold ?? 0) > masterWeight ||
+          Number(thresholds.med_threshold ?? 0) > masterWeight ||
+          Number(thresholds.high_threshold ?? 0) > masterWeight;
+
+        return {
+          key: signer.key,
+          weight: Number(signer.weight) || 0,
+          type: normalizeSignerType(signer.type),
+          isMultisig,
+        };
+      }),
+    );
+
+    return success(res, {
+      accountId: account.id,
+      delegatedSigners: resolvedSigners,
+    });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
