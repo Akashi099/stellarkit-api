@@ -129,6 +129,17 @@ export interface FeeTier {
   description?: string
 }
 
+/** Fee percentiles response data */
+export interface FeePercentiles {
+  p10: number
+  p50: number
+  p90: number
+  p95: number
+  p99: number
+  lastLedgerBaseFee: number
+  ledgerCapacityUsage: number
+}
+
 /** Ledger information */
 export interface LedgerInfo {
   sequence: number
@@ -225,6 +236,23 @@ export interface AssetMetadata {
   claimableBalancesAmount?: StellarAmount
   liquidityPoolsAmount?: StellarAmount
   flags?: unknown
+}
+
+/** Claimable balance entry */
+export interface ClaimableBalance {
+  balanceId: string | null
+  asset: {
+    code: string | null
+    issuer: StellarPublicKey | null
+    type: 'native' | 'credit_alphanum4' | 'credit_alphanum12'
+  }
+  amount: StellarAmount
+  sponsor: StellarPublicKey | null
+  createdAt: ISOTimestamp | null
+  claimants: Array<{
+    destination: StellarPublicKey
+    predicate: unknown
+  }>
 }
 
 /** Issuer account information */
@@ -340,6 +368,16 @@ export interface TransactionHistoryResponse {
 }
 
 /**
+ * Response from GET /account/:id/claimable-balances
+ * Returns a paginated list of normalized claimable balances for an account.
+ */
+export interface AccountClaimableBalancesResponse {
+  success: true
+  data: ClaimableBalance[]
+  meta: PaginationMeta
+}
+
+/**
  * Response from GET /transactions/:id/operations
  * Returns paginated operation history for a Stellar account.
  */
@@ -356,6 +394,12 @@ export interface OperationHistoryResponse {
 export interface FeeEstimateResponse {
   success: true
   data: {
+    baseFeeStroops: number
+    baseFeeXLM: StellarAmount
+    p50: FeeTier
+    p95: FeeTier
+    isSurge: boolean
+    lastLedgerSequence: number | null
     note: string
     operationCount: number
     perOperation: {
@@ -398,6 +442,12 @@ export interface NetworkStatusResponse {
   data: {
     network: string
     horizonUrl: string
+    horizonVersion: string | null
+    coreVersion: string | null
+    networkPassphrase: string | null
+    currentLedger: number | null
+    historyLatestLedger: number | null
+    isSynced: boolean
     latestLedger: LedgerInfo
     fees: {
       baseFeeInStroops: number
@@ -452,11 +502,19 @@ export interface AssetSearchResponse {
 export interface HealthResponse {
   success: true
   data: {
-    status: string
+    status: 'ok' | 'degraded' | 'unreachable'
     service: string
     version: string
     timestamp: ISOTimestamp
     network: string
+    uptimeSeconds?: number
+    nodeVersion?: string
+    startedAt?: ISOTimestamp
+    horizon: {
+      status: 'ok' | 'degraded' | 'unreachable'
+      responseTimeMs: number
+      network: string
+    }
   }
 }
 

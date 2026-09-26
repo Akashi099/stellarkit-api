@@ -4,10 +4,11 @@ const registerParamValidation = require("../middleware/validateRouteParams");
 registerParamValidation(router);
 const { server, NETWORK } = require("../config/stellar");
 const { success, toISOTimestamp } = require("../utils/response");
-const { validateAccountId } = require("../utils/validators");
+const { validateAccountId, validateTransactionHash } = require("../utils/validators");
 const { parsePaginationParams } = require("../utils/pagination");
 const { makeAccountNotFoundError } = require("../utils/errors");
 const { normalizeAsset } = require("../utils/asset");
+const { parseStellarAmount } = require("../utils/parseStellarAmount");
 
 function handleAccountNotFound(err, next, accountId) {
   if (err && err.response && err.response.status === 404) {
@@ -20,39 +21,67 @@ function handleAccountNotFound(err, next, accountId) {
 }
 
 /**
- * GET /transactions/:id
- * Returns paginated transaction history for a Stellar account.
+ * Map a raw Horizon transaction record to the StellarKit normalised shape.
  *
- * Query params:
- *   - limit   (number, default: 10, max: 200)
- *   - cursor  (string, pagination cursor from previous response)
- *   - order   ("asc" | "desc", default: "desc")
+ * Normalised fields (acceptance criteria):
+ *   transactionHash  — the unique transaction hash (primary identifier)
+ *   ledger           — ledger sequence number
+ *   createdAt        — ISO 8601 timestamp
+ *   operationCount   — number of operations inside the transaction
+ *   memo             — decoded memo string or null
+ *   successful       — whether the transaction was applied successfully
  *
- * @param {string} id - Stellar account public key (G...)
+ * Additional fields retained for full context:
+ *   id, sourceAccount, fee / feeSummary, memoType, envelopeXdr
  *
  * @example
- * GET /transactions/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
+ * GET /transactions/GAAZI4TCR3TY5OJHCTJ2C4Q6SY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
  * GET /transactions/GAAZI4...?limit=5&order=asc
  */
+function normaliseTransaction(tx) {
+  const chargedInStroops = parseInt(tx.fee_charged, 10) || 0;
+  const opCount = tx.operation_count || 1;
+  const perOpStroops = Math.floor(chargedInStroops / opCount);
+
+  return {
+    // Primary normalised fields (acceptance criteria)
+    transactionHash: tx.hash,
+    ledger: typeof tx.ledger === "number" ? tx.ledger : tx.ledger_attr,
+    createdAt: toISOTimestamp(tx.created_at),
+    operationCount: tx.operation_count,
+    memo: tx.memo || null,
+    successful: tx.successful,
+
+    // Extended context fields
+    id: tx.id,
+    sourceAccount: tx.source_account,
+    memoType: tx.memo_type,
+    envelopeXdr: tx.envelope_xdr,
+    fee: {
+      charged: tx.fee_charged,
+      chargedInXLM: parseStellarAmount(chargedInStroops),
+      max: tx.max_fee,
+      maxInXLM: parseStellarAmount(parseInt(tx.max_fee, 10) || 0),
+      account: tx.fee_account,
+    },
+    feeSummary: {
+      chargedInStroops,
+      chargedInXLM: parseStellarAmount(chargedInStroops),
+      perOperationInStroops: perOpStroops,
+      perOperationInXLM: parseStellarAmount(perOpStroops),
+    },
+  };
+}
 
 /**
- * Handler to fetch paginated transaction history for a Stellar account.
+ * GET /transactions/:id
  *
- * @async
- * @function
- * @param {import("express").Request} req - Express request object
- * @param {Object} req.params - Route parameters
- * @param {string} req.params.id - Stellar account public key (G...)
- * @param {Object} req.query - Query parameters
- * @param {string|number} [req.query.limit=10] - Number of records to return (max 200)
- * @param {string} [req.query.cursor] - Pagination cursor
- * @param {"asc"|"desc"} [req.query.order="desc"] - Sort order
- * @param {import("express").Response} res - Express response object
- * @param {import("express").NextFunction} next - Express next middleware function
+ * Returns paginated transaction history for a Stellar account pulled live
+ * from Horizon via server.transactions().forAccount(id).
  *
  * @returns {Promise<void>} Sends a JSON response:
  * {
- *   data: Array<{
+ *   data: Array<[
  *     id: string,
  *     hash: string,
  *     ledger: number,
@@ -67,7 +96,7 @@ function handleAccountNotFound(err, next, accountId) {
  *     memo: string | null,
  *     successful: boolean,
  *     envelopeXdr: string
- *   }>,
+ *   }],
  *   meta: {
  *     count: number,
  *     limit: number,
@@ -75,17 +104,20 @@ function handleAccountNotFound(err, next, accountId) {
  *     nextCursor: string | null,
  *     hasMore: boolean
  *   }
- * }
  *
- * @throws Will pass validation or network errors to next middleware
+ * @example
+ *   GET /transactions/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
+ *   GET /transactions/GAAZI4...?limit=5&order=asc&cursor=<token>
  */
 router.get("/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
 
-    const { limit, order, cursor } = parsePaginationParams(req.query);
+    // Supports limit, cursor, and order params (parsePaginationParams validates all three)
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
 
+    // Build the Horizon query — calls server.transactions().forAccount(id)
     let query = server
       .transactions()
       .forAccount(id)
@@ -96,46 +128,19 @@ router.get("/:id", async (req, res, next) => {
     if (cursor) query = query.cursor(cursor);
 
     const txResponse = await query.call();
+    const records = txResponse.records || [];
 
-    const STROOPS_PER_XLM = 10_000_000;
+    const transactions = records.map(normaliseTransaction);
 
-    const transactions = txResponse.records.map((tx) => {
-      const chargedInStroops = parseInt(tx.fee_charged, 10);
-      const opCount = tx.operation_count || 1;
-      const perOpStroops = Math.floor(chargedInStroops / opCount);
-
-      return {
-        id: tx.id,
-        hash: tx.hash,
-        ledger: typeof tx.ledger === "number" ? tx.ledger : tx.ledger_attr,
-        createdAt: toISOTimestamp(tx.created_at),
-        sourceAccount: tx.source_account,
-        fee: {
-          charged: tx.fee_charged,
-          chargedInXLM: (chargedInStroops / STROOPS_PER_XLM).toFixed(7),
-          max: tx.max_fee,
-          maxInXLM: (parseInt(tx.max_fee, 10) / STROOPS_PER_XLM).toFixed(7),
-          account: tx.fee_account,
-        },
-        feeSummary: {
-          chargedInStroops: chargedInStroops,
-          chargedInXLM: (chargedInStroops / STROOPS_PER_XLM).toFixed(7),
-          perOperationInStroops: perOpStroops,
-          perOperationInXLM: (perOpStroops / STROOPS_PER_XLM).toFixed(7),
-        },
-        operationCount: tx.operation_count,
-        memoType: tx.memo_type,
-        memo: tx.memo || null,
-        successful: tx.successful,
-        envelopeXdr: tx.envelope_xdr,
-      };
-    });
+    const nextCursor = records.length > 0
+      ? records[records.length - 1].paging_token
+      : null;
 
     return success(res, {
       items: transactions,
       total: transactions.length,
       limit,
-      cursor: txResponse.records.length > 0 ? txResponse.records[txResponse.records.length - 1].paging_token : null,
+      cursor: nextCursor,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
@@ -195,64 +200,121 @@ router.get("/:id", async (req, res, next) => {
  *
  * @throws Will pass validation or network errors to next middleware
  */
+const VALID_OPERATION_TYPES = new Set([
+  "create_account", "payment", "path_payment_strict_receive", "path_payment_strict_send",
+  "manage_sell_offer", "manage_buy_offer", "create_passive_sell_offer", "set_options",
+  "change_trust", "allow_trust", "account_merge", "inflation", "manage_data",
+  "bump_sequence", "create_claimable_balance", "claim_claimable_balance",
+  "begin_sponsoring_future_reserves", "end_sponsoring_future_reserves",
+  "revoke_sponsorship", "clawback", "clawback_claimable_balance",
+  "set_trust_line_flags", "liquidity_pool_deposit", "liquidity_pool_withdraw",
+  "invoke_host_function", "bump_footprint_expiration", "restore_footprint", "extend_footprint_ttl",
+]);
+
+function isNativeType(type) {
+  return !type || type === "native";
+}
+
+function normalizeOpAsset(code, issuer, type) {
+  if (isNativeType(type)) return { code: "XLM", issuer: null, type: "native" };
+  return { code: code || null, issuer: issuer || null, type };
+}
+
+function mapOperation(op) {
+  const base = {
+    operationId: op.id,
+    type: op.type,
+    createdAt: toISOTimestamp(op.created_at),
+    transactionHash: op.transaction_hash,
+    sourceAccount: op.source_account,
+  };
+
+  if (op.type === "payment") {
+    return {
+      ...base,
+      amount: op.amount,
+      asset: normalizeOpAsset(op.asset_code, op.asset_issuer, op.asset_type),
+      from: op.from,
+      to: op.to,
+    };
+  }
+  if (op.type === "create_account") {
+    return {
+      ...base,
+      startingBalance: op.starting_balance,
+      funder: op.funder,
+      account: op.account,
+    };
+  }
+  if (op.type === "change_trust") {
+    return {
+      ...base,
+      asset: normalizeOpAsset(op.asset_code, op.asset_issuer, op.asset_type),
+      limit: op.limit,
+      trustor: op.trustor,
+    };
+  }
+  if (op.type === "manage_sell_offer" || op.type === "manage_buy_offer" || op.type === "create_passive_sell_offer") {
+    return {
+      ...base,
+      amount: op.amount,
+      price: op.price,
+      offerId: op.offer_id,
+      sellingAsset: normalizeOpAsset(op.selling_asset_code, op.selling_asset_issuer, op.selling_asset_type),
+      buyingAsset: normalizeOpAsset(op.buying_asset_code, op.buying_asset_issuer, op.buying_asset_type),
+    };
+  }
+  if (op.type === "path_payment_strict_receive" || op.type === "path_payment_strict_send") {
+    return {
+      ...base,
+      amount: op.amount,
+      sourceAmount: op.source_amount,
+      from: op.from,
+      to: op.to,
+      asset: normalizeOpAsset(op.asset_code, op.asset_issuer, op.asset_type),
+      sourceAsset: normalizeOpAsset(op.source_asset_code, op.source_asset_issuer, op.source_asset_type),
+    };
+  }
+  return base;
+}
+
 router.get("/:id/operations", async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
 
-    const { limit, order, cursor } = parsePaginationParams(req.query);
+    const rawType = req.query.type;
+    if (rawType !== undefined) {
+      const normalizedType = String(rawType).toLowerCase().trim();
+      if (!VALID_OPERATION_TYPES.has(normalizedType)) {
+        const err = new Error(`Unknown operation type "${rawType}". Valid types are: ${[...VALID_OPERATION_TYPES].sort().join(", ")}.`);
+        err.isValidation = true;
+        return next(err);
+      }
+    }
 
-    let query = server
-      .operations()
-      .forAccount(id)
-      .limit(limit)
-      .order(order);
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
 
+    let query = server.operations().forAccount(id).limit(limit).order(order);
     if (cursor) query = query.cursor(cursor);
 
     const opResponse = await query.call();
+    const records = opResponse.records || [];
 
-    const operations = opResponse.records.map((op) => {
-      const formatted = {
-        id: op.id,
-        type: op.type,
-        createdAt: toISOTimestamp(op.created_at),
-        transactionHash: op.transaction_hash,
-        transactionSuccessful: op.transaction_successful,
-        sourceAccount: op.source_account,
-      };
+    const filtered = rawType
+      ? records.filter((op) => op.type === String(rawType).toLowerCase().trim())
+      : records;
 
-      // Add type-specific fields
-      if (op.type === "payment") {
-        formatted.asset = normalizeAsset(
-          op.asset_code || "XLM",
-          op.asset_issuer || null,
-          op.asset_type || "native",
-        );
-        formatted.amount = op.amount;
-        formatted.from = op.from;
-        formatted.to = op.to;
-      } else if (op.type === "create_account") {
-        formatted.startingBalance = op.starting_balance;
-        formatted.funder = op.funder;
-        formatted.account = op.account;
-      } else if (op.type === "change_trust") {
-        formatted.asset = normalizeAsset(op.asset_code, op.asset_issuer, op.asset_type);
-        formatted.trustor = op.trustor;
-        formatted.trustee = op.trustee;
-      }
+    const operations = filtered.map(mapOperation);
 
-      return formatted;
-    });
-
-    const lastRecord = opResponse.records[opResponse.records.length - 1];
+    const lastRecord = filtered[filtered.length - 1];
     const nextCursor = lastRecord ? lastRecord.paging_token : null;
 
     return success(res, {
-      items: operations,
+      operations,
       total: operations.length,
       limit,
-      cursor: nextCursor,
+      cursor: operations.length ? nextCursor : null,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
@@ -279,7 +341,7 @@ router.post("/batch-status", async (req, res, next) => {
     const { hashes } = req.body;
 
     if (!hashes || !Array.isArray(hashes)) {
-      const err = new Error("Property 'hashes' is required and must be an array.");
+      const err = new Error("property 'hashes' is required and must be an array.");
       err.isValidation = true;
       throw err;
     }
@@ -295,13 +357,8 @@ router.post("/batch-status", async (req, res, next) => {
     }
 
     // Validate each hash (64-character hex string)
-    const hashRegex = /^[0-9a-fA-F]{64}$/;
     for (const hash of hashes) {
-      if (!hashRegex.test(hash)) {
-        const err = new Error(`Invalid transaction hash: "${hash}". Must be a 64-character hex string.`);
-        err.isValidation = true;
-        throw err;
-      }
+      validateTransactionHash(hash);
     }
 
     // Perform lookups in parallel

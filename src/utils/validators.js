@@ -10,13 +10,6 @@ const { StrKey } = require("@stellar/stellar-sdk");
  */
 function qp(param, msg) {
   return `Query param '${param}' ${msg}`;
- * Build a query-parameter error message in the form "Query parameter '<field>': <detail>".
- * @param {string} field
- * @param {string} detail
- * @returns {string}
- */
-function qp(field, detail) {
-  return `Query parameter '${field}': ${detail}`;
 }
 
 /**
@@ -26,9 +19,12 @@ function qp(field, detail) {
  */
 function makeInvalidAccountIdError(accountId) {
   const err = new Error(
-    `"${String(accountId).slice(0, 60)}" is not a valid Stellar account address.`
+    `""${String(accountId).slice(0, 60)}" is not a valid Stellar account address.`
   );
   err.isInvalidAccountId = true;
+  // Stable marker used by the minResponseTime middleware to identify
+  // synchronous format rejections (which never touch Horizon).
+  err.type = "InvalidAccountId";
   err.accountId = accountId;
   err.suggestion = "Account addresses start with G and are 56 characters long.";
   err.status = 400;
@@ -79,6 +75,38 @@ function validateAccountId(accountId) {
   if (typeof accountId !== "string" || !StrKey.isValidEd25519PublicKey(accountId)) {
     throw makeInvalidAccountIdError(accountId);
   }
+}
+
+/**
+ * Validate a Stellar public key in lightweight boolean form.
+ *
+ * @param {string|null|undefined} address
+ * @returns {boolean}
+ */
+function validateStellarAddress(address) {
+  if (typeof address !== "string") return false;
+  const trimmed = address.trim();
+  if (!trimmed) return false;
+  if (!trimmed.startsWith("G")) return false;
+  if (trimmed.length !== 56) return false;
+  return StrKey.isValidEd25519PublicKey(trimmed);
+}
+
+/**
+ * Validate a credential type token.
+ *
+ * Allowed characters: letters, digits, underscore, dash, and dot.
+ * Maximum length: 64 characters.
+ *
+ * @param {string|null|undefined} type
+ * @returns {boolean}
+ */
+function validateCredentialType(type) {
+  if (typeof type !== "string") return false;
+  const trimmed = type.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 64) return false;
+  return /^[A-Za-z0-9._-]+$/.test(trimmed);
 }
 
 function validateContractId(contractId) {
@@ -161,7 +189,6 @@ function validateOrder(order) {
   const lowerOrder = String(order).toLowerCase();
   if (!["asc", "desc"].includes(lowerOrder)) {
     throw makeValidationError(
-      `Invalid order parameter: "${order}". Valid values are "asc" or "desc".`,
       qp("order", 'must be either "asc" or "desc".'),
       "order",
       order,
@@ -171,7 +198,6 @@ function validateOrder(order) {
   return lowerOrder;
 }
 
-module.exports = { validateAccountId, validateContractId, validateAssetCode, validateLimit, validateOrder };
 /**
  * Validates a Stellar asset defined by a code and issuer route parameter pair.
  *
@@ -189,7 +215,7 @@ function validateAsset(code, issuer) {
   if (!code) {
     throw makeInvalidAssetError(
       "Asset code is required.",
-      "Provide a valid asset code (1–12 alphanumeric characters), e.g. USDC."
+      "Provide a valid asset code (14–12 alphanumeric characters), e.g. USDC."
     );
   }
 
@@ -210,16 +236,142 @@ function validateAsset(code, issuer) {
   if (!issuer) {
     throw makeInvalidAssetError(
       "Asset issuer is required.",
-      "Provide the issuer's Stellar public key (a G... address), e.g. GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN."
+      "Provide the issuer's Stellar public key (a G... address), e.g. GA5ZSEYJB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN."
     );
   }
 
   if (!StrKey.isValidEd25519PublicKey(issuer)) {
     throw makeInvalidAssetError(
       `Issuer address "${String(issuer).slice(0, 10)}..." is not a valid Stellar public key.`,
-      "The issuer must be a valid Ed25519 public key starting with G (56 characters), e.g. GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN."
+      "The issuer must be a valid Ed25519 public key starting with G (56 characters), e.g. GA5ZSEYJB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN."
     );
   }
 }
 
-module.exports = { validateAccountId, validateAssetCode, validateLimit, validateOrder, validateAsset };
+/**
+ * Validate a pagination cursor value.
+ *
+ * A valid cursor is a non-empty string (as returned by Horizon's paging_token
+ * field).  Passing null, undefined, an empty string, or a non-string value
+ * throws a structured error that the central error handler maps to a 400
+ * response with the standardised InvalidCursor shape.
+ *
+ * Callers that receive `undefined` from `req.query.cursor` should skip this
+ * call entirely — the function is only needed when the caller explicitly
+ * intends to forward a cursor to Horizon.
+ *
+ * @param {*} cursor - The cursor value supplied by the API client.
+ * @returns {string} The validated cursor string (same value, type-confirmed).
+ * @throws {Error} Throws an error with `isInvalidCursor = true` when invalid.
+ *
+ * @example
+ * // In a paginated route:
+ * if (req.query.cursor !== undefined) {
+ *   validateCursor(req.query.cursor);
+ * }
+ */
+const CURSOR_PATTERN = /^[A-Za-z0-9-]+$/;
+
+function validateCursor(cursor) {
+  if (
+    cursor === null ||
+    cursor === undefined ||
+    typeof cursor !== "string" ||
+    cursor.trim() === "" ||
+    !CURSOR_PATTERN.test(cursor)
+  ) {
+    const err = new Error("The provided cursor value is invalid.");
+    err.isInvalidCursor = true;
+    err.type = "InvalidCursor";
+    err.suggestion = "Use the cursor returned in the previous response.";
+    err.status = 400;
+    throw err;
+  }
+  return cursor;
+}
+
+/**
+ * Validate and parse an ISO 8601 date string supplied as a query parameter.
+ *
+ * Accepts any string that JavaScript's Date constructor recognises as a valid
+ * date (e.g. "2024-01-15", "2024-01-15T12:00:00Z"). Empty strings and values
+ * that produce an invalid Date are rejected with a structured 400 error.
+ *
+ * @param {string} value - Raw query-parameter value to validate.
+ * @param {string} field - Parameter name used in error messages (e.g. "startDate").
+ * @returns {Date} A valid Date object.
+ * @throws {Error} A validation error (isValidation = true, status = 400) when invalid.
+ */
+function validateISODate(value, field) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw makeValidationError(
+      `Query param '${field}' must be a valid ISO 8601 date string (e.g. "2024-01-15" or "2024-01-15T12:00:00Z").`,
+      field,
+      value,
+      "ISO 8601 date string"
+    );
+  }
+  const date = new Date(value);
+  if (isNaN(date.getTime())) {
+    throw makeValidationError(
+      `Query param '${field}' is not a valid date: "${String(value).slice(0, 50)}".`,
+      field,
+      value,
+      "ISO 8601 date string"
+    );
+  }
+  return date;
+}
+
+/**
+ * Validate a transaction hash.
+ *
+ * A valid transaction hash is a 64-character hexadecimal string.
+ * Throws an error with `isInvalidTransactionHash = true` and the standardised
+ * { type: "InvalidTransactionHash", message, suggestion } shape when invalid.
+ *
+ * @param {string} hash - The transaction hash to validate.
+ * @returns {string} The validated hash (same value).
+ * @throws {Error} Throws an error with `isInvalidTransactionHash = true` when invalid.
+ */
+function validateTransactionHash(hash) {
+  const isHex64 = typeof hash === "string" && /^[0-9a-fA-F]{64}$/.test(hash);
+  if (!isHex64) {
+    const err = new Error(`'${hash}' is not a valid transaction hash.`);
+    err.isInvalidTransactionHash = true;
+    err.type = "InvalidTransactionHash";
+    err.suggestion = "Transaction hashes are 64-character hexadecimal strings.";
+    err.status = 400;
+    throw err;
+  }
+  return hash;
+}
+
+/**
+ * Returns true when the given string is a valid Stellar liquidity pool ID.
+ *
+ * A pool ID is a 64-character lowercase hexadecimal string as returned by
+ * Horizon. We validate the format before hitting Horizon so callers receive a
+ * clean 400 error rather than a Horizon 404 for a syntactically wrong ID.
+ *
+ * @param {string|null|undefined} poolId
+ * @returns {boolean}
+ */
+function isValidPoolId(poolId) {
+  return typeof poolId === "string" && /^[0-9a-f]{64}$/.test(poolId);
+}
+
+module.exports = {
+  validateAccountId,
+  validateContractId,
+  validateAssetCode,
+  validateLimit,
+  validateOrder,
+  validateAsset,
+  validateCursor,
+  validateISODate,
+  validateStellarAddress,
+  validateCredentialType,
+  validateTransactionHash,
+  isValidPoolId,
+};

@@ -55,7 +55,7 @@ describe("Transaction Batch Status Checker", () => {
         successful: true,
         ledger: 12345,
         createdAt: "2024-05-28T10:00:00.000Z",
-        fee: "100",
+        fee: "100.0000000",
       });
       expect(res.body.data.items[1]).toEqual({
         hash: ANOTHER_VALID_HASH,
@@ -63,7 +63,7 @@ describe("Transaction Batch Status Checker", () => {
         successful: false,
         ledger: 12346,
         createdAt: "2024-05-28T10:05:00.000Z",
-        fee: "200",
+        fee: "200.0000000",
       });
     });
 

@@ -5,11 +5,12 @@ const { success } = require("../utils/response");
 const cacheService = require("../services/cache");
 const CACHE_TTL = parseInt(process.env.CACHE_TTL_MS || "5000", 10) / 1000; // seconds
 const cacheTTL = require("../config/cacheConfig");
+const { formatLedgerSequence } = require("../utils/formatLedgerSequence");
 
-const STROOPS_PER_XLM = 10_000_000;
+const { parseStellarAmount } = require("../utils/parseStellarAmount");
+const { mapFeeStats } = require("../utils/mapFeeEstimate");
 
 const LEDGER_HISTORY_LIMIT = 5;
-const STROOP_DECIMALS = 7;
 
 const CAPACITY_USAGE_MAX = 1.0;
 const DEFAULT_MAX_TX_SET_SIZE = 1000;
@@ -34,7 +35,7 @@ router.get("/", async (req, res, next) => {
   try {
     const operations = Math.max(1, parseInt(req.query.operations) || 1);
     const cacheKey = `fee-estimate:${operations}`;
-    const fresh = req.query.fresh === "true";
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
 
     // Check cache first (unless fresh=true)
     if (!fresh) {
@@ -57,27 +58,28 @@ router.get("/", async (req, res, next) => {
 
     const recommended = parseInt(feeStats.fee_charged.p50);
     const priority = parseInt(feeStats.fee_charged.p95);
-
+    const liveFees = mapFeeStats(feeStats);
 
     const data = {
+      ...liveFees,
       note: `Fee estimates for a transaction with ${operations} operation(s). Fees are in stroops (1 XLM = 10,000,000 stroops).`,
       operationCount: operations,
       perOperation: {
         economy: {
           stroops: parseInt(feeStats.fee_charged.min),
-          xlm: (parseInt(feeStats.fee_charged.min) / STROOPS_PER_XLM).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(parseInt(feeStats.fee_charged.min)),
 
           description: "Minimum — may be slow during congestion",
         },
         standard: {
           stroops: recommended,
-          xlm: (recommended / STROOPS_PER_XLM).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(recommended),
 
           description: "Recommended for most transactions",
         },
         priority: {
           stroops: priority,
-          xlm: (priority / STROOPS_PER_XLM).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(priority),
 
           description: "Fast inclusion even during high network load",
         },
@@ -85,23 +87,19 @@ router.get("/", async (req, res, next) => {
       totalFee: {
         economy: {
           stroops: parseInt(feeStats.fee_charged.min) * operations,
-          xlm: (
-            (parseInt(feeStats.fee_charged.min) * operations) / STROOPS_PER_XLM
-          ).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(
+            parseInt(feeStats.fee_charged.min) * operations
+          ),
 
         },
         standard: {
           stroops: recommended * operations,
-          xlm: (
-            (recommended * operations) / STROOPS_PER_XLM
-          ).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(recommended * operations),
 
         },
         priority: {
           stroops: priority * operations,
-          xlm: (
-            (priority * operations) / STROOPS_PER_XLM
-          ).toFixed(STROOP_DECIMALS),
+          xlm: parseStellarAmount(priority * operations),
 
         },
       },
@@ -115,7 +113,7 @@ router.get("/", async (req, res, next) => {
         p99: feeStats.fee_charged.p99,
       },
       history: ledgerHistoryRecords.map((ledger) => ({
-        ledger: parseInt(ledger.sequence, 10),
+        ledger: formatLedgerSequence(ledger.sequence),
         baseFee: parseInt(ledger.base_fee_in_stroops || ledger.base_fee, 10) || 0,
         capacityUsage: parseFloat(
           Math.min(
@@ -145,8 +143,6 @@ router.get("/", async (req, res, next) => {
       })(),
     };
 
-    // Cache the response
-    cacheService.set(cacheKey, data, CACHE_TTL);
     cacheService.set(cacheKey, data, cacheTTL.feeEstimate);
 
     res.set("X-Cache", "MISS");
@@ -169,7 +165,7 @@ router.get("/", async (req, res, next) => {
 router.get("/surge-status", async (req, res, next) => {
   try {
     const cacheKey = "fee-surge-status";
-    const fresh = req.query.fresh === "true";
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
 
     // Check cache first (unless fresh=true)
     if (!fresh) {
@@ -249,7 +245,7 @@ router.get("/surge-status", async (req, res, next) => {
         parseFloat(usage.toFixed(4))
       ),
       suggestedFee,
-      suggestedFeeInXLM: (suggestedFee / STROOPS_PER_XLM).toFixed(STROOP_DECIMALS),
+      suggestedFeeInXLM: parseStellarAmount(suggestedFee),
 
       recommendation,
       currentNetworkStats: {
@@ -278,7 +274,7 @@ router.get("/surge-status", async (req, res, next) => {
 router.get("/trends", async (req, res, next) => {
   try {
     const cacheKey = "fee-trends";
-    const fresh = req.query.fresh === "true";
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
 
     // Check cache first (unless fresh=true)
     if (!fresh) {
@@ -346,6 +342,107 @@ router.get("/trends", async (req, res, next) => {
 
     res.set("X-Cache", "MISS");
     return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /fee-estimate/batch
+ * Returns fee estimates for multiple transaction types in a single call.
+ *
+ * Accepts an array of transaction type descriptors (type + operationCount) and
+ * returns a computed fee estimate for each entry. Maximum 10 entries per request.
+ *
+ * Request body:
+ *   { transactions: [{ type: string, operationCount: number }] }
+ *
+ * Response:
+ *   { success: true, data: { estimates: [{ type, operationCount, feeStroops, feeXLM }] } }
+ *
+ * @example
+ * POST /fee-estimate/batch
+ * { "transactions": [{ "type": "payment", "operationCount": 1 }, { "type": "swap", "operationCount": 3 }] }
+ */
+router.post("/batch", async (req, res, next) => {
+  try {
+    const BATCH_MAX = 10;
+    const { transactions } = req.body || {};
+
+    // Validate presence and type
+    if (!transactions || !Array.isArray(transactions)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: "Property 'transactions' is required and must be an array.",
+          suggestion: "Send a JSON body with { transactions: [{ type, operationCount }] }.",
+        },
+      });
+    }
+
+    // Enforce maximum batch size
+    if (transactions.length > BATCH_MAX) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: `Maximum of ${BATCH_MAX} transactions allowed per batch request. Received ${transactions.length}.`,
+          suggestion: `Split your request into batches of ${BATCH_MAX} or fewer entries.`,
+        },
+      });
+    }
+
+    // Validate each entry has the required shape
+    for (let i = 0; i < transactions.length; i++) {
+      const tx = transactions[i];
+      if (!tx || typeof tx !== "object") {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: `transactions[${i}] must be an object with 'type' (string) and 'operationCount' (number).`,
+          },
+        });
+      }
+      if (typeof tx.type !== "string" || tx.type.trim() === "") {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: `transactions[${i}].type must be a non-empty string.`,
+          },
+        });
+      }
+      const opCount = Number(tx.operationCount);
+      if (!Number.isInteger(opCount) || opCount < 1) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: `transactions[${i}].operationCount must be a positive integer.`,
+          },
+        });
+      }
+    }
+
+    // Fetch live fee stats from Horizon (single call for the whole batch)
+    const feeStats = await server.feeStats();
+
+    const baseFeeStroops = parseInt(feeStats.fee_charged.p50, 10) || 100;
+
+    const estimates = transactions.map((tx) => {
+      const operationCount = Math.max(1, parseInt(tx.operationCount, 10));
+      const feeStroops = baseFeeStroops * operationCount;
+      return {
+        type: tx.type,
+        operationCount,
+        feeStroops,
+        feeXLM: parseStellarAmount(feeStroops),
+      };
+    });
+
+    return success(res, { estimates });
   } catch (err) {
     next(err);
   }

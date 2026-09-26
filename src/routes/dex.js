@@ -6,9 +6,11 @@ const { Asset } = require("@stellar/stellar-sdk");
 const { server } = require("../config/stellar");
 const { success } = require("../utils/response");
 const { validateAssetCode, validateAccountId, validateAsset, validateLimit } = require("../utils/validators");
-const { parseStellarAsset } = require("../utils/asset");
+const { parseStellarAsset, normalizeAsset } = require("../utils/asset");
+const { isNativeAsset } = require("../utils/assetHelpers");
 const cacheService = require("../services/cache");
 const cacheTTL = require("../config/cacheConfig");
+const { makeOrderBookEmptyError } = require("../utils/errors");
 
 /**
  * @route GET /dex/arbitrage/:assetCode/:assetIssuer
@@ -53,7 +55,7 @@ router.get("/arbitrage/:assetCode/:assetIssuer", async (req, res, next) => {
     // A fixed key covers all pairs per asset; TTL defaults to 5 s and is
     // configurable via CACHE_TTL_ARBITRAGE_MS.
     const ARBITRAGE_CACHE_KEY = `dex:arbitrage:${assetCode.toUpperCase()}:${assetIssuer}`;
-    const fresh = req.query.fresh === "true";
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
 
     if (!fresh) {
       const cached = cacheService.get(ARBITRAGE_CACHE_KEY);
@@ -63,7 +65,8 @@ router.get("/arbitrage/:assetCode/:assetIssuer", async (req, res, next) => {
       }
     }
 
-    const asset = (assetCode.toUpperCase() === "XLM" && assetIssuer.toLowerCase() === "native")
+    const assetIdentifier = { code: assetCode.toUpperCase(), issuer: assetIssuer.toLowerCase() };
+    const asset = (isNativeAsset(assetIdentifier) || (assetCode.toUpperCase() === "XLM" && assetIssuer.toLowerCase() === "native"))
       ? Asset.native()
       : new Asset(assetCode.toUpperCase(), assetIssuer);
 
@@ -539,7 +542,7 @@ router.get("/price/:sellAsset/:buyAsset", async (req, res, next) => {
  * @returns {{ code: string, issuer: string|null, type: string }}
  */
 function formatAsset(type, code, issuer) {
-  if (type === "native") {
+  if (isNativeAsset({ type })) {
     return { code: "XLM", issuer: null, type: "native" };
   }
   return {
@@ -554,8 +557,8 @@ function formatAsset(type, code, issuer) {
  * Alphabetical ordering ensures XLM/USDC and USDC/XLM map to the same key.
  */
 function pairKey(baseType, baseCode, baseIssuer, counterType, counterCode, counterIssuer) {
-  const a = baseType === "native" ? "XLM:native" : `${baseCode}:${baseIssuer}`;
-  const b = counterType === "native" ? "XLM:native" : `${counterCode}:${counterIssuer}`;
+  const a = isNativeAsset({ type: baseType }) ? "XLM:native" : `${baseCode}:${baseIssuer}`;
+  const b = isNativeAsset({ type: counterType }) ? "XLM:native" : `${counterCode}:${counterIssuer}`;
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
@@ -679,12 +682,12 @@ router.get("/top-markets", async (req, res, next) => {
         let spread = null;
         try {
           const selling =
-            market.baseAsset.type === "native"
+            isNativeAsset(market.baseAsset)
               ? Asset.native()
               : new Asset(market.baseAsset.code, market.baseAsset.issuer);
 
           const buying =
-            market.counterAsset.type === "native"
+            isNativeAsset(market.counterAsset)
               ? Asset.native()
               : new Asset(market.counterAsset.code, market.counterAsset.issuer);
 
@@ -718,6 +721,288 @@ router.get("/top-markets", async (req, res, next) => {
 
     cacheService.set(cacheKey, data, cacheTTL.topMarkets);
 
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /dex/arbitrage-opportunities
+ *
+ * Scans the live Stellar DEX order books for common XLM trading pairs and
+ * returns pairs where the bid-ask spread implies a potentially profitable
+ * round-trip trade.
+ *
+ * Strategy:
+ *   For each candidate pair we fetch the top order-book level from Horizon.
+ *   When both a best-bid and best-ask exist we compute:
+ *     spread        = bestAsk − bestBid   (in the counter asset)
+ *     profitPercent = spread / midPrice × 100
+ *   A spread > 0 qualifies as an opportunity; the confidence label is derived
+ *   from the magnitude of profitPercent.
+ *
+ * Confidence thresholds:
+ *   profitPercent ≥ 2.0  → "high"
+ *   profitPercent ≥ 0.5  → "medium"
+ *   profitPercent > 0    → "low"
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       opportunities: [
+ *         {
+ *           buyAsset:      { code: "XLM", issuer: null, type: "native" },
+ *           sellAsset:     { code: "USDC", issuer: "GA5Z...", type: "credit_alphanum4" },
+ *           spread:        "0.0012340",
+ *           profitPercent: "0.9800000",
+ *           confidence:    "medium"
+ *         },
+ *         ...
+ *       ],
+ *       total:     2,
+ *       timestamp: "2024-07-01T12:00:00.000Z"
+ *     }
+ *   }
+ *
+ * Caching: 5 s TTL (configurable via CACHE_TTL_ARBITRAGE_MS).
+ *
+ * @example
+ * curl -s "http://localhost:3000/dex/arbitrage-opportunities" | jq
+ */
+router.get("/arbitrage-opportunities", async (req, res, next) => {
+  try {
+    const CACHE_KEY = "dex:arbitrage-opportunities";
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(CACHE_KEY);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // ── Candidate XLM trading pairs ─────────────────────────────────────────
+    // Each entry is { buyAsset, sellAsset } expressed as SDK Asset objects plus
+    // human-readable label strings for the response.
+    const WELL_KNOWN_ISSUERS = {
+      USDC: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      AQUA: "GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA",
+      YXLM: "GARDNV3Q7YGT4AKSDF25LT32YSCCW4EV22Y2TV3I2PU2MMXJTEDL5T55",
+      EURC: "GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2",
+      BTC:  "GDXTJEK4JZNSTNQV4IUSX3AQ4EACSSAXGMZQFLKQ6BKLR57ELBQINPB",
+    };
+
+    const pairs = Object.entries(WELL_KNOWN_ISSUERS).map(([code, issuer]) => ({
+      buyAsset: normalizeAsset("XLM", null, "native"),
+      sellAsset: normalizeAsset(code, issuer),
+      buying: Asset.native(),
+      selling: new Asset(code, issuer),
+    }));
+
+    // ── Fetch order books in parallel ──────────────────────────────────────
+    const results = await Promise.allSettled(
+      pairs.map(async (pair) => {
+        const ob = await server
+          .orderbook(pair.selling, pair.buying)
+          .limit(1)
+          .call();
+
+        const bids = ob.bids || [];
+        const asks = ob.asks || [];
+
+        if (bids.length === 0 || asks.length === 0) return null;
+
+        const bestBid = parseFloat(bids[0].price);
+        const bestAsk = parseFloat(asks[0].price);
+
+        if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) return null;
+
+        const spread       = bestAsk - bestBid;
+        const midPrice     = (bestBid + bestAsk) / 2;
+        const profitPct    = (spread / midPrice) * 100;
+
+        let confidence;
+        if (profitPct >= 2.0) {
+          confidence = "high";
+        } else if (profitPct >= 0.5) {
+          confidence = "medium";
+        } else {
+          confidence = "low";
+        }
+
+        return {
+          buyAsset: pair.buyAsset,
+          sellAsset: pair.sellAsset,
+          spread: spread.toFixed(7),
+          profitPercent: profitPct.toFixed(7),
+          confidence: confidence.toLowerCase(),
+        };
+      }),
+    );
+
+    // ── Filter to profitable opportunities only ──────────────────────────────
+    const opportunities = results
+      .filter((r) => r.status === "fulfilled" && r.value !== null)
+      .map((r) => r.value);
+
+    const data = {
+      opportunities,
+      total:     opportunities.length,
+      timestamp: new Date().toISOString(),
+    };
+
+    cacheService.set(CACHE_KEY, data, cacheTTL.arbitrage);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const PRICE_HISTORY_RESOLUTIONS = {
+  "1h": { windowMs: 60 * 60 * 1000, bucketMs: 5 * 60 * 1000 },
+  "24h": { windowMs: 24 * 60 * 60 * 1000, bucketMs: 60 * 60 * 1000 },
+  "7d": { windowMs: 7 * 24 * 60 * 60 * 1000, bucketMs: 24 * 60 * 60 * 1000 },
+};
+
+function parseDexAssetParam(assetString) {
+  const parts = assetString.split(":");
+  if (parts.length !== 2) {
+    throw new Error(`Invalid asset format: "${assetString}". Expected format: CODE:ISSUER`);
+  }
+  const [code, issuer] = parts;
+  if (code.toUpperCase() === "XLM" && issuer.toLowerCase() === "native") {
+    return Asset.native();
+  }
+  validateAssetCode(code);
+  validateAccountId(issuer);
+  return new Asset(code.toUpperCase(), issuer);
+}
+
+function tradePrice(trade) {
+  const priceN = trade.price?.n;
+  const priceD = trade.price?.d;
+  if (priceN != null && priceD != null && Number(priceD) !== 0) {
+    return Number(priceN) / Number(priceD);
+  }
+  const baseAmount = parseFloat(trade.base_amount || "0");
+  const counterAmount = parseFloat(trade.counter_amount || "0");
+  if (baseAmount > 0) {
+    return counterAmount / baseAmount;
+  }
+  return 0;
+}
+
+function aggregateTradesIntoBuckets(trades, windowStartMs, bucketMs) {
+  const buckets = new Map();
+
+  for (const trade of trades) {
+    const tradeTime = new Date(trade.ledger_close_time).getTime();
+    if (tradeTime < windowStartMs) {
+      continue;
+    }
+
+    const bucketStart = Math.floor(tradeTime / bucketMs) * bucketMs;
+    if (!buckets.has(bucketStart)) {
+      buckets.set(bucketStart, {
+        timestamp: new Date(bucketStart).toISOString(),
+        weightedPriceSum: 0,
+        baseVolume: 0,
+        counterVolume: 0,
+      });
+    }
+
+    const bucket = buckets.get(bucketStart);
+    const baseAmount = parseFloat(trade.base_amount || "0");
+    const counterAmount = parseFloat(trade.counter_amount || "0");
+    const price = tradePrice(trade);
+
+    bucket.weightedPriceSum += price * baseAmount;
+    bucket.baseVolume += baseAmount;
+    bucket.counterVolume += counterAmount;
+  }
+
+  return Array.from(buckets.values())
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+    .map((bucket) => ({
+      timestamp: bucket.timestamp,
+      price: bucket.baseVolume > 0
+        ? (bucket.weightedPriceSum / bucket.baseVolume).toFixed(7)
+        : "0.0000000",
+      baseVolume: bucket.baseVolume.toFixed(7),
+      counterVolume: bucket.counterVolume.toFixed(7),
+    }));
+}
+
+/**
+ * GET /dex/price-history/:sellAsset/:buyAsset
+ *
+ * Returns recent trade prices for an asset pair as a time series.
+ * Query params: resolution=1h|24h|7d (default 24h)
+ */
+router.get("/price-history/:sellAsset/:buyAsset", async (req, res, next) => {
+  try {
+    const { sellAsset, buyAsset } = req.params;
+    const resolution = req.query.resolution || "24h";
+
+    if (!PRICE_HISTORY_RESOLUTIONS[resolution]) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: "Invalid resolution. Accepted values are 1h, 24h, and 7d.",
+          field: "resolution",
+          receivedValue: String(resolution),
+        },
+      });
+    }
+
+    let baseAsset;
+    let counterAsset;
+    try {
+      baseAsset = parseDexAssetParam(sellAsset);
+      counterAsset = parseDexAssetParam(buyAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    const { windowMs, bucketMs } = PRICE_HISTORY_RESOLUTIONS[resolution];
+    const windowStartMs = Date.now() - windowMs;
+    const cacheKey = `dex:price-history:${sellAsset}:${buyAsset}:${resolution}`;
+    const fresh = req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const tradesResponse = await server
+      .trades()
+      .forAssetPair(baseAsset, counterAsset)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = tradesResponse.records || [];
+    const prices = aggregateTradesIntoBuckets(trades, windowStartMs, bucketMs);
+
+    const data = {
+      prices,
+      pair: `${sellAsset}/${buyAsset}`,
+      resolution,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.arbitrage);
+    res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
     next(err);

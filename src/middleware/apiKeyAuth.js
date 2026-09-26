@@ -5,6 +5,25 @@
 // Returns 401 for missing/invalid key when enabled
 // /health and / endpoints are always public
 
+const crypto = require('crypto');
+
+// Load and hash all API keys on startup (module load)
+let hashedKeys = [];
+
+const rawKeys = process.env.API_KEYS;
+if (rawKeys) {
+  const keysArray = rawKeys.split(',').map(key => key.trim());
+  hashedKeys = keysArray.map(key =>
+    crypto.createHash('sha256').update(key).digest('hex')
+  );
+
+  // Clear plaintext keys from memory to prevent extraction if compromised
+  for (let i = 0; i < keysArray.length; i++) {
+    keysArray[i] = '';
+  }
+  delete process.env.API_KEYS;
+}
+
 const apiKeyMiddleware = (req, res, next) => {
   const requireApiKey = process.env.REQUIRE_API_KEY === 'true';
 
@@ -33,13 +52,8 @@ const apiKeyMiddleware = (req, res, next) => {
     });
   }
 
-  // Get valid keys from environment variable (comma-separated)
-  const validKeys = process.env.API_KEYS
-    ? process.env.API_KEYS.split(',').map(key => key.trim())
-    : [];
-
   // If no valid keys are configured, treat as misconfiguration (but still deny)
-  if (validKeys.length === 0) {
+  if (hashedKeys.length === 0) {
     return res.status(401).json({
       success: false,
       error: {
@@ -49,8 +63,29 @@ const apiKeyMiddleware = (req, res, next) => {
     });
   }
 
-  // Validate the provided key
-  if (!validKeys.includes(apiKey)) {
+  // Hash the incoming key with SHA-256 for secure comparison
+  const incomingHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+
+  // Validate the provided key's hash using constant-time comparison to prevent timing attacks
+  let keyIsValid = false;
+  for (const hashedKey of hashedKeys) {
+    try {
+      if (
+        hashedKey.length === incomingHash.length &&
+        crypto.timingSafeEqual(
+          Buffer.from(hashedKey),
+          Buffer.from(incomingHash),
+        )
+      ) {
+        keyIsValid = true;
+        break;
+      }
+    } catch (err) {
+      // Continue checking other keys
+    }
+  }
+
+  if (!keyIsValid) {
     return res.status(401).json({
       success: false,
       error: {

@@ -1,3 +1,5 @@
+const { formatAmount } = require("./formatAmount");
+
 /**
  * Wraps data in a consistent success response envelope.
  *
@@ -48,4 +50,76 @@ function stripLinks(obj) {
   return rest;
 }
 
-module.exports = { success, toISOTimestamp, formatTimestamp, stripLinks };
+const AMOUNT_KEYS = new Set([
+  "amount",
+  "balance",
+  "startingbalance",
+  "sourceamount",
+  "destinationamount",
+  "baseamount",
+  "counteramount",
+  "totalamount",
+  "buyingliabilities",
+  "sellingliabilities",
+  "price",
+  "priceinxlm",
+  "effectiverate",
+  "fee",
+  "feecharged",
+  "feepool",
+  "basefeeinxlm",
+  "basereserveinxlm",
+  "maxinxlm",
+  "xlm",
+]);
+
+function shouldNormalizeAmountKey(key, value) {
+  if (value === null || value === undefined) return false;
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") {
+    return false;
+  }
+
+  const normalizedKey = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (!normalizedKey) return false;
+  if (normalizedKey.includes("stroop")) return false;
+  if (normalizedKey === "feebp" || normalizedKey === "pricenumerator" || normalizedKey === "pricedenominator") {
+    return false;
+  }
+
+  return (
+    AMOUNT_KEYS.has(normalizedKey) ||
+    normalizedKey.endsWith("amount") ||
+    normalizedKey.endsWith("balance") ||
+    normalizedKey.endsWith("price") ||
+    normalizedKey.endsWith("fee") ||
+    normalizedKey.endsWith("liabilities")
+  );
+}
+
+function normalizeAmountFields(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeAmountFields(item));
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const normalized = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (shouldNormalizeAmountKey(key, entry)) {
+      normalized[key] = formatAmount(entry);
+    } else {
+      normalized[key] = normalizeAmountFields(entry);
+    }
+  }
+  return normalized;
+}
+
+module.exports = {
+  success,
+  toISOTimestamp,
+  formatTimestamp,
+  stripLinks,
+  normalizeAmountFields,
+};

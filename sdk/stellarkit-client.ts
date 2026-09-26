@@ -15,7 +15,7 @@ import type {
   AssetSearchResponse,
   PoolPositionsResponse,
   TransactionSearchResponse,
-} from "../types/index.d";
+} from "../types/index.d.ts";
 
 /**
  * Typed error thrown by StellarKitClient on non-2xx API responses.
@@ -135,8 +135,9 @@ export class StellarKitClient {
    *
    * @returns Network status data
    */
-  async getNetworkStatus(): Promise<NetworkStatusResponse["data"]> {
-    return this._request("/network-status");
+  async getNetworkStatus(options?: { fresh?: boolean }): Promise<NetworkStatusResponse["data"]> {
+    const params = options?.fresh ? { fresh: true } : null;
+    return this._request("/network-status", { params });
   }
 
   /**
@@ -772,6 +773,18 @@ export class StellarKitClient {
    */
   async getPoolReserveRatio(poolId: string): Promise<unknown> {
     return this._request(`/liquidity-pools/${poolId}/reserve-ratio`);
+  }
+
+  // ── Soroban Contracts ─────────────────────────────────────────────────────
+
+  /**
+   * Get Soroban contract metadata backed by live Stellar RPC data.
+   *
+   * @param contractId - Soroban contract ID
+   * @returns Contract metadata including deployer and expiry status
+   */
+  async getSorobanContract(contractId: string): Promise<unknown> {
+    return this._request(`/soroban/contract/${contractId}`);
   }
 
   // ── Claimable Balances ─────────────────────────────────────────────────────
