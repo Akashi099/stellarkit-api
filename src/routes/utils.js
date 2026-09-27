@@ -11,7 +11,7 @@ const { server } = require("../config/stellar");
 const FRIENDBOT_URL = "https://friendbot.stellar.org";
 const STROOPS_PER_XLM = 10000000n;
 const AVERAGE_LEDGER_CLOSE_SECONDS = 5;
-const { decodeMemo } = require("../utils/memo");
+const { decodeMemo, validateMemo } = require("../utils/memo");
 
 function createValidationError(message) {
   const err = new Error(message);
@@ -149,6 +149,19 @@ router.get("/memo", (req, res, next) => {
       return next(err);
     }
     err.isValidation = true;
+    return next(err);
+  }
+});
+
+/**
+ * POST /utils/validate-memo
+ * Validate a memo value before it is attached to a transaction.
+ */
+router.post("/validate-memo", (req, res, next) => {
+  try {
+    const { type, value } = req.body || {};
+    return success(res, validateMemo(type, value));
+  } catch (err) {
     return next(err);
   }
 });
