@@ -1096,7 +1096,15 @@ router.get("/market-summary/:baseAsset/:counterAsset", async (req, res, next) =>
   }
 });
 
-// LIQUIDITY_DEPTH_PLACEHOLDER
+/**
+ * GET /dex/liquidity-depth/:baseAsset/:counterAsset
+ *
+ * Returns cumulative bid and ask volume at configurable price intervals,
+ * helping developers estimate slippage before submitting a trade.
+ *
+ * Query params:
+ *   levels (number, 1–50, default: 10) — number of price levels to return
+ */
 router.get("/liquidity-depth/:baseAsset/:counterAsset", async (req, res, next) => {
   try {
     const { baseAsset, counterAsset } = req.params;
