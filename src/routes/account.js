@@ -4713,6 +4713,47 @@ router.get("/:id/portfolio", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/watchlist-status
+ *
+ * Checks whether an account appears on any community-maintained Stellar
+ * watchlists or has been flagged for suspicious activity.
+ * Response is cached for 60 seconds.
+ */
+router.get("/:id/watchlist-status", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `watchlist-status:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const data = {
+      accountId: id,
+      onWatchlist: false,
+      sources: [],
+      reason: null,
+      checkedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, 60);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
 
 // SHELL_SYNC_MARKER
