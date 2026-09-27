@@ -328,4 +328,65 @@ router.delete("/:webhookId", webhookSignatureAuth, (req, res, next) => {
  * POST /webhooks/:webhookId/pause
  *
  * Pause a webhook by setting its status to "paused".
- * Paused webhooks will not receive e
+ * Paused webhooks will not receive event deliveries until resumed.
+ *
+ * Response 200:
+ *   { "success": true, "data": { "webhookId": "wh_...", "status": "paused" } }
+ *
+ * Response 404: webhook not found.
+ */
+router.post("/:webhookId/pause", webhookSignatureAuth, (req, res, next) => {
+  try {
+    const { webhookId } = req.params;
+    const existing = webhookStore.find(webhookId);
+    if (!existing) {
+      return next(
+        new StellarKitError(
+          `Webhook '${webhookId}' was not found.`,
+          404,
+          "WebhookNotFound",
+          null,
+          "Verify the webhookId is correct. Use GET /webhooks to list all registered webhooks.",
+        ),
+      );
+    }
+    webhookStore.updateStatus(webhookId, "paused");
+    return success(res, { webhookId, status: "paused" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /webhooks/:webhookId/resume
+ *
+ * Resume a paused webhook by setting its status back to "active".
+ *
+ * Response 200:
+ *   { "success": true, "data": { "webhookId": "wh_...", "status": "active" } }
+ *
+ * Response 404: webhook not found.
+ */
+router.post("/:webhookId/resume", webhookSignatureAuth, (req, res, next) => {
+  try {
+    const { webhookId } = req.params;
+    const existing = webhookStore.find(webhookId);
+    if (!existing) {
+      return next(
+        new StellarKitError(
+          `Webhook '${webhookId}' was not found.`,
+          404,
+          "WebhookNotFound",
+          null,
+          "Verify the webhookId is correct. Use GET /webhooks to list all registered webhooks.",
+        ),
+      );
+    }
+    webhookStore.updateStatus(webhookId, "active");
+    return success(res, { webhookId, status: "active" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;

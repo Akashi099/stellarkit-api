@@ -64,6 +64,7 @@ This project is ideal for:
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
+- [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
 
 ---
 
@@ -107,7 +108,7 @@ This project is ideal for:
 | GET | `/account/:id/analytics` | Account activity analytics: transaction frequency, first/last seen timestamps, and average transactions per day | — |
 | GET | `/account/:id/transaction-count` | Total transaction count, first and last transaction timestamps | — |
 | GET | `/account/:id/inactivity` | Days since last transaction and status | — |
-| GET | `/account/:id/volume` | Transaction volume by asset over a time period | `days` |
+| GET | `/account/:id/volume` | Transaction volume by asset over a time period (default: 30 days, max: 90 days) | `days` (default: 30, max: 90) |
 | GET | `/account/:id/risk-score` | Computed risk score and contributing factors | — |
 | GET | `/account/:id/freeze-status/:assetCode/:assetIssuer` | Check if an asset is frozen on an account | — |
 | GET | `/account/:id/can-receive/:assetCode/:assetIssuer` | Check if an account can receive a specific asset | — |
@@ -434,11 +435,23 @@ If a medium-threshold operation requires `2`, then either signer C alone or sign
 StellarKit API exposes the account's multisignature details through dedicated account endpoints:
 
 - `GET /account/:id/signers` returns the account's current signers and their weights.
-- `GET /account/:id/multisig-plan` returns the account's threshold plan and how signers contribute to low, medium, and high threshold requirements.
+- `POST /account/:id/multisig-plan` returns the account's threshold plan and how signers contribute to low, medium, and high threshold requirements.
 
 These endpoints let developers inspect who can sign transactions, how much combined weight is available, and whether the account is configured correctly for its intended security model.
 
-> Use `GET /account/:id/signers` to verify signer keys and weights, and `GET /account/:id/multisig-plan` to understand the threshold requirements before submitting multisig transactions.
+> Use `GET /account/:id/signers` to verify signer keys and weights, and `POST /account/:id/multisig-plan` to understand the threshold requirements before submitting multisig transactions. The multisig-plan endpoint accepts a JSON body with an `availableSigners` array — the list of signer public keys you expect to use.
+
+```bash
+curl -X POST http://localhost:3000/account/GABC.../multisig-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "availableSigners": [
+      "GABC...",
+      "GDEF...",
+      "GXYZ..."
+    ]
+  }'
+```
 
 ---
 
