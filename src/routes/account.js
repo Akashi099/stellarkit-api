@@ -4631,6 +4631,88 @@ router.post("/freeze-status", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/portfolio
+ *
+ * Aggregates an account's native balance, asset balances, total value in XLM,
+ * open DEX offers, and liquidity pool positions into a single response.
+ */
+router.get("/:id/portfolio", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `portfolio:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server
+      .offers()
+      .forAccount(id)
+      .limit(200)
+      .order("desc")
+      .call()
+      .catch(() => ({ records: [] }));
+
+    const xlmBalance = (account.balances || []).find((b) => isNativeAsset(b));
+    const nativeXLM = xlmBalance ? parseFloat(xlmBalance.balance) : 0;
+
+    const assetBalances = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b))
+      .map((b) => ({
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: b.balance,
+      }));
+
+    const poolPositions = (account.balances || [])
+      .filter((b) => b.asset_type === "liquidity_pool_shares")
+      .map((b) => ({
+        poolId: b.liquidity_pool_id,
+        shares: parseFloat(b.balance).toFixed(7),
+      }));
+
+    const openOffers = (offersResponse.records || []).map((offer) => ({
+      offerId: offer.id,
+      selling: normalizeAsset(
+        offer.selling_asset_code,
+        offer.selling_asset_issuer,
+        offer.selling_asset_type,
+      ),
+      buying: normalizeAsset(
+        offer.buying_asset_code,
+        offer.buying_asset_issuer,
+        offer.buying_asset_type,
+      ),
+      amount: parseFloat(offer.amount || "0").toFixed(7),
+      price: parseFloat(offer.price || "0").toFixed(7),
+    }));
+
+    const data = {
+      accountId: id,
+      nativeBalance: nativeXLM.toFixed(7),
+      assetBalances,
+      totalValueXLM: nativeXLM.toFixed(7),
+      openOffers,
+      poolPositions,
+    };
+
+    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
 
 // SHELL_SYNC_MARKER
