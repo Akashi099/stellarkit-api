@@ -329,6 +329,11 @@ router.delete("/:webhookId", webhookSignatureAuth, (req, res, next) => {
  *
  * Pause a webhook by setting its status to "paused".
  * Paused webhooks will not receive event deliveries until resumed.
+ *
+ * Response 200:
+ *   { "success": true, "data": { "webhookId": "wh_...", "status": "paused" } }
+ *
+ * Response 404: webhook not found.
  */
 router.post("/:webhookId/pause", webhookSignatureAuth, (req, res, next) => {
   try {
@@ -356,6 +361,11 @@ router.post("/:webhookId/pause", webhookSignatureAuth, (req, res, next) => {
  * POST /webhooks/:webhookId/resume
  *
  * Resume a paused webhook by setting its status back to "active".
+ *
+ * Response 200:
+ *   { "success": true, "data": { "webhookId": "wh_...", "status": "active" } }
+ *
+ * Response 404: webhook not found.
  */
 router.post("/:webhookId/resume", webhookSignatureAuth, (req, res, next) => {
   try {
@@ -379,4 +389,5 @@ router.post("/:webhookId/resume", webhookSignatureAuth, (req, res, next) => {
   }
 });
 
+module.exports = router;
 module.exports = router;
