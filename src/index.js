@@ -709,6 +709,24 @@ app.get("/", (req, res) => {
         },
         {
           method: "GET",
+          path: "/dex/volume-leaders",
+          description:
+            "Top assets by 24h DEX volume against XLM (optional ?limit=, default 10, max 50)",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/payment-counterparty-risk",
+          description:
+            "Risk assessment of an account's top payment counterparties (optional ?limit=, default 10, max 20)",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/offers-summary",
+          description:
+            "Aggregated open offer totals per asset (cached; ?fresh=true bypasses cache)",
+        },
+        {
+          method: "GET",
           path: "/liquidity-pools/:id/reserve-ratio",
           description:
             "Get reserve ratio and drift from equal for a liquidity pool",

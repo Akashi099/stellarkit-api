@@ -739,6 +739,157 @@ router.get("/top-markets", async (req, res, next) => {
 });
 
 /**
+ * GET /dex/volume-leaders?limit=10
+ * Returns the top non-native assets ranked by 24-hour DEX trading volume
+ * against XLM.
+ *
+ * Query params:
+ *   - limit  (number, 1–50, default: 10)
+ *
+ * Response shape:
+ *   { success: true, data: { leaders: [...], updatedAt } }
+ *
+ * Each leader entry:
+ *   {
+ *     asset:              { code, issuer, type },
+ *     volume24h:          "1234567.0000000",  // XLM volume, seven decimals
+ *     tradeCount:         42,
+ *     priceChangePercent: "1.2345678" | null, // null when only one trade
+ *     uniqueTraders:      17
+ *   }
+ *
+ * Strategy:
+ *   Horizon has no "volume by asset" endpoint. We fetch the most recent 200
+ *   trades, keep only XLM-paired trades from the last 24 hours, aggregate per
+ *   asset client-side and rank by XLM volume descending. priceChangePercent is
+ *   derived from the oldest and newest XLM price observed in the window.
+ *
+ * Caching: 5 minute TTL (configurable via CACHE_TTL_VOLUME_LEADERS_MS).
+ *
+ * @example
+ * GET /dex/volume-leaders?limit=5
+ */
+router.get("/volume-leaders", async (req, res, next) => {
+  try {
+    const MAX_LIMIT = 50;
+    const DEFAULT_LIMIT = 10;
+    const rawLimit = req.query.limit;
+
+    let limit = DEFAULT_LIMIT;
+    if (rawLimit !== undefined) {
+      const parsed = parseInt(rawLimit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: "limit must be a positive integer between 1 and 50.",
+          },
+        });
+      }
+      limit = Math.min(parsed, MAX_LIMIT);
+    }
+
+    const cacheKey = `dex:volume-leaders:${limit}`;
+    const cached = cacheService.get(cacheKey);
+    if (cached) {
+      res.set("X-Cache", "HIT");
+      return success(res, cached);
+    }
+    res.set("X-Cache", "MISS");
+
+    const tradesResponse = await server
+      .trades()
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = tradesResponse.records || [];
+    const windowStart = Date.now() - 24 * 60 * 60 * 1000;
+    const assetMap = new Map();
+
+    for (const trade of trades) {
+      const closeTime = new Date(trade.ledger_close_time).getTime();
+      if (Number.isFinite(closeTime) && closeTime < windowStart) continue;
+
+      const baseNative = isNativeAsset({ type: trade.base_asset_type });
+      const counterNative = isNativeAsset({ type: trade.counter_asset_type });
+      // Only XLM-paired trades contribute to volume against XLM
+      if (baseNative === counterNative) continue;
+
+      const side = baseNative ? "counter" : "base";
+      const assetType = trade[`${side}_asset_type`];
+      const assetCode = trade[`${side}_asset_code`];
+      const assetIssuer = trade[`${side}_asset_issuer`];
+      const assetAmount = parseFloat(trade[`${side}_amount`] || "0");
+      const xlmAmount = parseFloat(
+        (baseNative ? trade.base_amount : trade.counter_amount) || "0",
+      );
+      const key = `${assetCode}:${assetIssuer}`;
+
+      if (!assetMap.has(key)) {
+        assetMap.set(key, {
+          asset: formatAsset(assetType, assetCode, assetIssuer),
+          volume: 0,
+          tradeCount: 0,
+          traders: new Set(),
+          newestPrice: null,
+          oldestPrice: null,
+        });
+      }
+
+      const entry = assetMap.get(key);
+      entry.volume += xlmAmount;
+      entry.tradeCount += 1;
+      if (trade.base_account) entry.traders.add(trade.base_account);
+      if (trade.counter_account) entry.traders.add(trade.counter_account);
+
+      // Price of the asset in XLM. Trades are ordered newest first.
+      if (assetAmount > 0) {
+        const price = xlmAmount / assetAmount;
+        if (entry.newestPrice === null) entry.newestPrice = price;
+        entry.oldestPrice = price;
+      }
+    }
+
+    const leaders = Array.from(assetMap.values())
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, limit)
+      .map((entry) => {
+        let priceChangePercent = null;
+        if (
+          entry.tradeCount > 1 &&
+          entry.oldestPrice !== null &&
+          entry.oldestPrice > 0
+        ) {
+          priceChangePercent = (
+            ((entry.newestPrice - entry.oldestPrice) / entry.oldestPrice) * 100
+          ).toFixed(7);
+        }
+
+        return {
+          asset: entry.asset,
+          volume24h: entry.volume.toFixed(7),
+          tradeCount: entry.tradeCount,
+          priceChangePercent,
+          uniqueTraders: entry.traders.size,
+        };
+      });
+
+    const data = {
+      leaders,
+      updatedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.volumeLeaders);
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * GET /dex/arbitrage-opportunities
  *
  * Scans the live Stellar DEX order books for common XLM trading pairs and

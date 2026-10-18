@@ -4,6 +4,8 @@ StellarKit API provides a suite of compliance-oriented endpoints that help devel
 
 This guide covers all compliance endpoints with curl examples, sample responses, and a worked example showing how to chain endpoints together for a complete compliance check.
 
+> For an end-to-end KYC/AML onboarding workflow that produces a compliance report for a new account, see the [Compliance Workflow Guide](./compliance-workflow.md).
+
 ---
 
 ## Overview
@@ -498,6 +500,7 @@ For high-volume compliance workflows, consider:
 
 ## Related Documentation
 
+- [Compliance Workflow Guide](./compliance-workflow.md) - Step-by-step KYC/AML workflow and compliance report example
 - [Account Endpoints Guide](./account-endpoints.md) - Full list of account endpoints
 - [Batch Endpoints Guide](./batch-endpoints.md) - Batch compliance checking
 - [Rate Limiting](./rate-limiting.md) - Rate limit details and strategies

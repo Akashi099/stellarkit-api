@@ -99,6 +99,12 @@ const cacheTTL = {
     60000
   ),
 
+  /** /dex/volume-leaders — 24h asset volume ranking, refresh every 5 min by default */
+  volumeLeaders: msToSeconds(
+    process.env.CACHE_TTL_VOLUME_LEADERS_MS,
+    300000
+  ),
+
   /** /dex/arbitrage — market conditions change rapidly, short TTL by default */
   arbitrage: msToSeconds(
     process.env.CACHE_TTL_ARBITRAGE_MS,
