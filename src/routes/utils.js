@@ -5,7 +5,18 @@ const registerParamValidation = require("../middleware/validateRouteParams");
 registerParamValidation(router);
 const { success } = require("../utils/response");
 const { validateAccountId } = require("../utils/validators");
-const { Transaction, Networks, Keypair } = require("@stellar/stellar-sdk");
+const {
+  Transaction,
+  TransactionBuilder,
+  FeeBumpTransaction,
+  Networks,
+  Keypair,
+  Asset,
+  LiquidityPoolAsset,
+  Claimant,
+  Address,
+} = require("@stellar/stellar-sdk");
+const { normalizeAsset } = require("../utils/asset");
 const { server } = require("../config/stellar");
 
 const FRIENDBOT_URL = "https://friendbot.stellar.org";
@@ -536,6 +547,270 @@ router.post("/decode-xdr", (req, res, next) => {
     };
 
     return success(res, decoded);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * Converts an SDK camelCase operation type (e.g. "pathPaymentStrictSend")
+ * into the snake_case form Horizon uses (e.g. "path_payment_strict_send").
+ */
+function toSnakeCaseType(type) {
+  return String(type).replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+function formatAssetLabel(asset) {
+  if (!asset || typeof asset !== "object") return String(asset);
+  if (asset.type === "native") return "XLM";
+  if (asset.code) return `${asset.code}:${asset.issuer}`;
+  if (asset.liquidityPoolId) return `liquidity pool ${asset.liquidityPoolId}`;
+  return asset.type || "unknown asset";
+}
+
+/**
+ * Recursively converts values found on SDK operation objects (Asset
+ * instances, Claimants, Buffers, XDR structs, BigInts) into plain JSON with
+ * camelCase keys.
+ */
+function toPlainValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return Buffer.from(value).toString("base64");
+  }
+  if (Array.isArray(value)) return value.map(toPlainValue);
+  if (value instanceof Asset) {
+    return value.isNative()
+      ? normalizeAsset("XLM", null, "native")
+      : normalizeAsset(value.getCode(), value.getIssuer(), value.getAssetType());
+  }
+  if (value instanceof LiquidityPoolAsset) {
+    const params = value.getLiquidityPoolParameters();
+    return {
+      type: "liquidity_pool_shares",
+      assetA: toPlainValue(value.assetA),
+      assetB: toPlainValue(value.assetB),
+      fee: params.fee,
+    };
+  }
+  if (value instanceof Claimant) {
+    return {
+      destination: value.destination,
+      predicate: value.predicate.toXDR("base64"),
+    };
+  }
+  if (typeof value === "object") {
+    if (typeof value.toXDR === "function") return value.toXDR("base64");
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !key.startsWith("_"))
+        .map(([key, v]) => [key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()), toPlainValue(v)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Extracts contract id / function name from an invokeHostFunction operation.
+ */
+function describeHostFunction(func) {
+  try {
+    const kind = func.switch().name;
+    if (kind === "hostFunctionTypeInvokeContract") {
+      const invoke = func.invokeContract();
+      return {
+        hostFunctionType: "invoke_contract",
+        contractId: Address.fromScAddress(invoke.contractAddress()).toString(),
+        function: invoke.functionName().toString(),
+        argsCount: invoke.args().length,
+      };
+    }
+    if (kind === "hostFunctionTypeCreateContract" || kind === "hostFunctionTypeCreateContractV2") {
+      return { hostFunctionType: "create_contract" };
+    }
+    if (kind === "hostFunctionTypeUploadContractWasm") {
+      return { hostFunctionType: "upload_contract_wasm" };
+    }
+    return { hostFunctionType: kind };
+  } catch (_) {
+    return { hostFunctionType: "unknown" };
+  }
+}
+
+/**
+ * Produces a short plain-language description of a decoded operation.
+ */
+function summarizeOperation(op, source) {
+  const who = source || "the transaction source";
+  switch (op.type) {
+    case "create_account":
+      return `${who} creates account ${op.destination} with a starting balance of ${op.startingBalance} XLM`;
+    case "payment":
+      return `${who} pays ${op.amount} ${formatAssetLabel(op.asset)} to ${op.destination}`;
+    case "path_payment_strict_receive":
+      return `${who} sends at most ${op.sendMax} ${formatAssetLabel(op.sendAsset)} so that ${op.destination} receives exactly ${op.destAmount} ${formatAssetLabel(op.destAsset)}`;
+    case "path_payment_strict_send":
+      return `${who} sends exactly ${op.sendAmount} ${formatAssetLabel(op.sendAsset)} so that ${op.destination} receives at least ${op.destMin} ${formatAssetLabel(op.destAsset)}`;
+    case "manage_sell_offer":
+      return `${who} offers to sell ${op.amount} ${formatAssetLabel(op.selling)} for ${formatAssetLabel(op.buying)} at price ${op.price}`;
+    case "manage_buy_offer":
+      return `${who} offers to buy ${op.buyAmount} ${formatAssetLabel(op.buying)} with ${formatAssetLabel(op.selling)} at price ${op.price}`;
+    case "create_passive_sell_offer":
+      return `${who} creates a passive offer to sell ${op.amount} ${formatAssetLabel(op.selling)} for ${formatAssetLabel(op.buying)} at price ${op.price}`;
+    case "set_options":
+      return `${who} updates account options`;
+    case "change_trust":
+      return `${who} sets a trustline for ${formatAssetLabel(op.line)} with limit ${op.limit}`;
+    case "allow_trust":
+      return `${who} ${op.authorize ? "authorizes" : "deauthorizes"} ${op.trustor} to hold ${op.assetCode}`;
+    case "account_merge":
+      return `${who} merges its account into ${op.destination}`;
+    case "manage_data":
+      return op.value === null || op.value === undefined
+        ? `${who} deletes data entry "${op.name}"`
+        : `${who} sets data entry "${op.name}"`;
+    case "bump_sequence":
+      return `${who} bumps its sequence number to ${op.bumpTo}`;
+    case "create_claimable_balance":
+      return `${who} creates a claimable balance of ${op.amount} ${formatAssetLabel(op.asset)}`;
+    case "claim_claimable_balance":
+      return `${who} claims claimable balance ${op.balanceId}`;
+    case "begin_sponsoring_future_reserves":
+      return `${who} begins sponsoring future reserves for ${op.sponsoredId}`;
+    case "end_sponsoring_future_reserves":
+      return `${who} ends sponsoring future reserves`;
+    case "clawback":
+      return `${who} claws back ${op.amount} ${formatAssetLabel(op.asset)} from ${op.from}`;
+    case "invoke_host_function":
+      return op.contractId
+        ? `${who} invokes function "${op.function}" on contract ${op.contractId}`
+        : `${who} invokes a Soroban host function (${op.hostFunctionType})`;
+    default:
+      return `${who} performs a ${op.type.replace(/_/g, " ")} operation`;
+  }
+}
+
+/**
+ * Formats a single SDK operation into a camelCase, JSON-safe breakdown.
+ */
+function formatDecodedOperation(op, index) {
+  const { type, source, ...fields } = op;
+  const formatted = {
+    index,
+    type: toSnakeCaseType(type),
+    source: source || null,
+  };
+
+  const plainFields = toPlainValue(fields);
+  if (type === "invokeHostFunction") {
+    Object.assign(formatted, describeHostFunction(op.func));
+    formatted.auth = plainFields.auth || [];
+  } else {
+    Object.assign(formatted, plainFields);
+  }
+
+  formatted.description = summarizeOperation(formatted, source);
+  return formatted;
+}
+
+function formatTimeBound(value) {
+  const seconds = Number(value || 0);
+  return {
+    unix: seconds,
+    iso: seconds > 0 ? new Date(seconds * 1000).toISOString() : null,
+  };
+}
+
+/**
+ * POST /utils/decode-transaction
+ * Decode a base64 transaction envelope XDR into a human-readable breakdown:
+ * fee (stroops and XLM), source account, sequence number, time bounds, memo
+ * and each operation with its type, source and type-specific fields in
+ * camelCase plus a plain-language description.
+ *
+ * Fee-bump envelopes are supported: the outer fee and fee source are reported
+ * and the inner transaction is decoded for the remaining fields.
+ *
+ * Body: { xdr: string }
+ *
+ * @returns {{ fee, feeXLM, sourceAccount, sequenceNumber, timeBounds, memo,
+ *   operationCount, operations, envelopeType, feeBump }}
+ * @throws {Error} 400 when xdr is missing, not valid base64, or not a valid
+ *   transaction envelope
+ *
+ * @example
+ * POST /utils/decode-transaction
+ * { "xdr": "AAAAAgAAAAD..." }
+ */
+router.post("/decode-transaction", (req, res, next) => {
+  try {
+    const { xdr: envelopeXdr } = req.body || {};
+
+    if (typeof envelopeXdr !== "string" || envelopeXdr.trim() === "") {
+      throw createValidationError("Field 'xdr' is required and must be a base64-encoded transaction envelope.");
+    }
+
+    const input = envelopeXdr.trim();
+    if (!BASE64_PATTERN.test(input) || input.length % 4 !== 0) {
+      throw createValidationError("Field 'xdr' is not valid base64.");
+    }
+
+    const networkPassphrase = process.env.STELLAR_NETWORK === "mainnet"
+      ? Networks.PUBLIC
+      : Networks.TESTNET;
+
+    let envelope;
+    try {
+      envelope = TransactionBuilder.fromXDR(input, networkPassphrase);
+    } catch (e) {
+      throw createValidationError(
+        `Field 'xdr' is valid base64 but could not be decoded as a Stellar transaction envelope: ${e.message}`,
+      );
+    }
+
+    const isFeeBump = envelope instanceof FeeBumpTransaction;
+    const tx = isFeeBump ? envelope.innerTransaction : envelope;
+    const fee = String(envelope.fee);
+
+    const memo = tx.memo && tx.memo.type !== "none"
+      ? {
+          type: tx.memo.type,
+          value: Buffer.isBuffer(tx.memo.value)
+            ? tx.memo.value.toString("hex")
+            : String(tx.memo.value),
+        }
+      : null;
+
+    const timeBounds = tx.timeBounds
+      ? {
+          minTime: formatTimeBound(tx.timeBounds.minTime),
+          maxTime: formatTimeBound(tx.timeBounds.maxTime),
+        }
+      : null;
+
+    const operations = tx.operations.map((op, index) => formatDecodedOperation(op, index));
+
+    return success(res, {
+      envelopeType: isFeeBump ? "fee_bump" : "transaction",
+      fee,
+      feeXLM: formatStroopsToXlm(fee),
+      sourceAccount: tx.source,
+      sequenceNumber: tx.sequence,
+      timeBounds,
+      memo,
+      operationCount: operations.length,
+      operations,
+      feeBump: isFeeBump
+        ? {
+            feeSource: envelope.feeSource,
+            innerFee: String(tx.fee),
+            innerFeeXLM: formatStroopsToXlm(tx.fee),
+          }
+        : null,
+    });
   } catch (err) {
     next(err);
   }

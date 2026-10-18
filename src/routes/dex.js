@@ -12,6 +12,7 @@ const { formatAmount } = require("../utils/formatAmount");
 const cacheService = require("../services/cache");
 const cacheTTL = require("../config/cacheConfig");
 const { makeOrderBookEmptyError } = require("../utils/errors");
+const StellarKitError = require("../utils/StellarKitError");
 
 /**
  * @route GET /dex/arbitrage/:assetCode/:assetIssuer
@@ -1289,6 +1290,159 @@ router.get("/liquidity-depth/:baseAsset/:counterAsset", async (req, res, next) =
         error: makeOrderBookEmptyError(req.params.baseAsset, req.params.counterAsset),
       });
     }
+    next(err);
+  }
+});
+
+/**
+ * Converts an SDK Asset instance into the standard { code, issuer, type } shape.
+ *
+ * @param {Asset} asset
+ * @returns {{ code: string, issuer: string|null, type: string }}
+ */
+function assetToObject(asset) {
+  if (asset.isNative()) return normalizeAsset("XLM", null, "native");
+  return normalizeAsset(asset.getCode(), asset.getIssuer(), asset.getAssetType());
+}
+
+function makeNoPathFoundError(sourceAsset, destAsset) {
+  return new StellarKitError(
+    `No conversion path exists from ${sourceAsset} to ${destAsset}.`,
+    404,
+    "NoPathFound",
+    "Horizon could not find any order book or liquidity pool route between these assets for the requested amount.",
+    "Try a smaller amount, or check that both assets have active markets on the Stellar DEX."
+  );
+}
+
+/**
+ * GET /dex/best-path/:sourceAsset/:destAsset?amount=1
+ * Finds the optimal conversion path between two assets using Horizon's
+ * strict-send path finding, and reports the estimated rate, total slippage
+ * and the ordered sequence of assets to route through.
+ *
+ * Assets are given in `CODE:ISSUER` format, or `XLM:native` for lumens.
+ *
+ * Query params:
+ *   - amount (positive number, default: 1) — amount of sourceAsset to convert.
+ *
+ * Slippage is estimated by comparing the best rate for the requested amount
+ * against the best rate for a small reference trade (1% of the amount), which
+ * approximates the marginal (spot) rate along the best available route.
+ *
+ * Response shape:
+ *   {
+ *     sourceAsset:     { code, issuer, type },
+ *     destAsset:       { code, issuer, type },
+ *     path:            [{ code, issuer, type }, ...], // source → intermediates → destination
+ *     estimatedRate:   "0.1275000",   // destAsset received per 1 sourceAsset
+ *     slippagePercent: "0.4200",
+ *     hops:            1,             // number of intermediate assets routed through
+ *     sourceAmount:    "100.0000000",
+ *     destinationAmount: "12.7500000"
+ *   }
+ *
+ * @throws 400 ValidationError for malformed assets or amount
+ * @throws 404 NoPathFound when no conversion path exists
+ *
+ * @example
+ * GET /dex/best-path/XLM:native/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN?amount=100
+ */
+router.get("/best-path/:sourceAsset/:destAsset", async (req, res, next) => {
+  try {
+    const { sourceAsset, destAsset } = req.params;
+
+    let source, dest;
+    try {
+      source = parseStellarAsset(sourceAsset);
+      dest = parseStellarAsset(destAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    if (source.equals(dest)) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "sourceAsset and destAsset must be different." },
+      });
+    }
+
+    const rawAmount = req.query.amount === undefined ? "1" : String(req.query.amount);
+    const parsedAmount = parseFloat(rawAmount);
+    if (!/^\d+(\.\d+)?$/.test(rawAmount) || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "amount must be a positive number." },
+      });
+    }
+
+    const formattedAmount = parsedAmount.toFixed(7);
+    const referenceAmount = Math.max(parsedAmount / 100, 0.0000001).toFixed(7);
+
+    const pickBest = (records) =>
+      records.reduce((a, b) =>
+        parseFloat(a.destination_amount) >= parseFloat(b.destination_amount) ? a : b
+      );
+
+    const fetchPaths = async (amount) => {
+      try {
+        const response = await server.strictSendPaths(source, amount, [dest]).call();
+        return response.records || [];
+      } catch (err) {
+        if (err.response && err.response.status === 404) return [];
+        throw err;
+      }
+    };
+
+    const [records, referenceRecords] = await Promise.all([
+      fetchPaths(formattedAmount),
+      fetchPaths(referenceAmount),
+    ]);
+
+    if (records.length === 0) {
+      throw makeNoPathFoundError(sourceAsset, destAsset);
+    }
+
+    const best = pickBest(records);
+    const sourceAmount = parseFloat(best.source_amount);
+    const destinationAmount = parseFloat(best.destination_amount);
+
+    if (!(sourceAmount > 0) || !(destinationAmount > 0)) {
+      throw makeNoPathFoundError(sourceAsset, destAsset);
+    }
+
+    const estimatedRate = destinationAmount / sourceAmount;
+
+    let slippagePercent = 0;
+    if (referenceRecords.length > 0) {
+      const reference = pickBest(referenceRecords);
+      const referenceRate =
+        parseFloat(reference.destination_amount) / parseFloat(reference.source_amount);
+      if (Number.isFinite(referenceRate) && referenceRate > estimatedRate) {
+        slippagePercent = ((referenceRate - estimatedRate) / referenceRate) * 100;
+      }
+    }
+
+    const intermediates = (best.path || []).map((hop) =>
+      normalizeAsset(hop.asset_code, hop.asset_issuer, hop.asset_type),
+    );
+    const sourceObject = assetToObject(source);
+    const destObject = assetToObject(dest);
+
+    return success(res, {
+      sourceAsset: sourceObject,
+      destAsset: destObject,
+      path: [sourceObject, ...intermediates, destObject],
+      estimatedRate: estimatedRate.toFixed(7),
+      slippagePercent: slippagePercent.toFixed(4),
+      hops: intermediates.length,
+      sourceAmount: sourceAmount.toFixed(7),
+      destinationAmount: destinationAmount.toFixed(7),
+    });
+  } catch (err) {
     next(err);
   }
 });
