@@ -48,7 +48,7 @@ const { formatLedgerSequence } = require("../utils/formatLedgerSequence");
 
 
 const axios = require("axios");
-const { Asset } = require("@stellar/stellar-sdk");
+const { Asset, scValToNative, xdr } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
 const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
@@ -5843,6 +5843,272 @@ router.get("/:id/funding-history", async (req, res, next) => {
       fundingSources,
       firstFundedAt,
       totalFundingAmount,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const FEE_SPENDING_PAGE_SIZE = 200;
+const FEE_SPENDING_MAX_PAGES = 10;
+
+/**
+ * GET /account/:id/fee-spending?days=30
+ *
+ * Aggregates the network fees an account has paid over the last `days` days,
+ * broken down by operation type.
+ *
+ * Only transactions whose fee was paid by this account (fee_account, falling
+ * back to source_account) are counted. Each transaction's charged fee is split
+ * evenly across its operations so that multi-operation transactions are
+ * attributed proportionally to each operation type.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30)
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     period: { days, from, to },
+ *     transactionCount,
+ *     totalFeesXLM,       // sum of fee_charged across counted transactions
+ *     averageFeeXLM,      // totalFeesXLM / transactionCount
+ *     breakdown: [{ type, count, transactionCount, totalFeesXLM, averageFeeXLM }]
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../fee-spending?days=7
+ */
+router.get("/:id/fee-spending", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const days = parseInt(req.query.days || "30", 10);
+    if (isNaN(days) || days < 1 || days > 90) {
+      const err = new Error(
+        "Query parameter 'days': must be an integer between 1 and 90.",
+      );
+      err.isValidation = true;
+      err.field = "days";
+      err.receivedValue = String(req.query.days);
+      err.expectedFormat = "1–90";
+      throw err;
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const transactions = new Map();
+    const byType = new Map();
+    let cursor;
+    let reachedEnd = false;
+
+    for (let page = 0; page < FEE_SPENDING_MAX_PAGES && !reachedEnd; page++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .join("transactions")
+        .limit(FEE_SPENDING_PAGE_SIZE)
+        .order("desc")
+        .includeFailed(true);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at) < since) {
+          reachedEnd = true;
+          break;
+        }
+
+        const tx = op.transaction;
+        if (!tx || typeof tx !== "object") continue;
+        const payer = tx.fee_account || tx.source_account;
+        if (payer !== id) continue;
+
+        const txHash = tx.hash || op.transaction_hash;
+        const feeStroops = parseInt(tx.fee_charged || 0, 10) || 0;
+        const opCount = parseInt(tx.operation_count, 10) || 1;
+        if (!transactions.has(txHash)) {
+          transactions.set(txHash, { feeStroops, types: new Set() });
+        }
+        const txEntry = transactions.get(txHash);
+
+        const type = op.type || "unknown";
+        if (!byType.has(type)) {
+          byType.set(type, { type, count: 0, transactionCount: 0, feesStroops: 0 });
+        }
+        const bucket = byType.get(type);
+        bucket.count += 1;
+        bucket.feesStroops += feeStroops / opCount;
+        if (!txEntry.types.has(type)) {
+          bucket.transactionCount += 1;
+          txEntry.types.add(type);
+        }
+      }
+
+      if (records.length < FEE_SPENDING_PAGE_SIZE) reachedEnd = true;
+    }
+
+    let totalFeesStroops = 0;
+    for (const { feeStroops } of transactions.values()) totalFeesStroops += feeStroops;
+
+    const transactionCount = transactions.size;
+    const breakdown = [...byType.values()]
+      .map((bucket) => ({
+        type: bucket.type,
+        count: bucket.count,
+        transactionCount: bucket.transactionCount,
+        totalFeesXLM: parseStellarAmount(Math.round(bucket.feesStroops)),
+        averageFeeXLM: parseStellarAmount(bucket.feesStroops / bucket.transactionCount),
+      }))
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+
+    return success(res, {
+      accountId: id,
+      period: { days, from: since.toISOString(), to: new Date().toISOString() },
+      transactionCount,
+      totalFeesXLM: parseStellarAmount(totalFeesStroops),
+      averageFeeXLM: parseStellarAmount(
+        transactionCount > 0 ? totalFeesStroops / transactionCount : 0,
+      ),
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Decodes a base64 ScVal parameter from a Horizon invoke_host_function
+ * operation record into a native JS value, or null when it cannot be decoded.
+ *
+ * @param {{ value?: string }|undefined} param
+ * @returns {*}
+ */
+function decodeHostFunctionParam(param) {
+  if (!param || typeof param.value !== "string") return null;
+  try {
+    const native = scValToNative(xdr.ScVal.fromXDR(param.value, "base64"));
+    if (native === undefined || native === null) return null;
+    return typeof native === "string" ? native : native.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Shapes a Horizon invoke_host_function operation record into a contract
+ * interaction summary.
+ *
+ * For contract invocations Horizon exposes the call as `parameters`, where the
+ * first entry is the contract address and the second is the function symbol.
+ * Other host functions (contract upload / creation) have no function symbol,
+ * so the host function type is reported instead.
+ *
+ * @param {object} op - Raw Horizon operation record
+ * @returns {{ contractId: string|null, function: string|null, timestamp: string|null,
+ *   success: boolean, transactionHash: string, hostFunctionType: string|null }}
+ */
+function mapContractInteraction(op) {
+  const hostFunctionType = op.function
+    ? String(op.function).replace(/^HostFunctionType(HostFunctionType)?/, "")
+    : null;
+  const params = Array.isArray(op.parameters) ? op.parameters : [];
+  const isInvoke = hostFunctionType === null || /InvokeContract/i.test(hostFunctionType);
+
+  const contractId = isInvoke ? decodeHostFunctionParam(params[0]) : null;
+  const fnName = isInvoke ? decodeHostFunctionParam(params[1]) : null;
+
+  return {
+    contractId,
+    function: fnName || hostFunctionType,
+    timestamp: toISOTimestamp(op.created_at),
+    success: op.transaction_successful !== false,
+    transactionHash: op.transaction_hash,
+    hostFunctionType,
+  };
+}
+
+const CONTRACT_INTERACTIONS_PAGE_SIZE = 200;
+const CONTRACT_INTERACTIONS_MAX_PAGES = 10;
+
+/**
+ * GET /account/:id/smart-contract-interactions?limit=20&cursor=...
+ *
+ * Filters the account's operation history for `invoke_host_function`
+ * operations and returns a summarised list of Soroban contract interactions,
+ * newest first.
+ *
+ * Query params:
+ *   - limit  (integer, 1–200, default: 20) — maximum interactions to return
+ *   - cursor (Horizon paging token)        — continue from a previous response
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     interactions: [{ contractId, function, timestamp, success, transactionHash }],
+ *     total,   // number of interactions in this page
+ *     limit,
+ *     cursor   // pass back as ?cursor= for the next page; null when history is exhausted
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../smart-contract-interactions?limit=10
+ */
+router.get("/:id/smart-contract-interactions", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const { limit, cursor: startCursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const interactions = [];
+    let cursor = startCursor;
+    let nextCursor = null;
+
+    for (let page = 0; page < CONTRACT_INTERACTIONS_MAX_PAGES; page++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .limit(CONTRACT_INTERACTIONS_PAGE_SIZE)
+        .order("desc")
+        .includeFailed(true);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (op.type !== "invoke_host_function") continue;
+        interactions.push(mapContractInteraction(op));
+        if (interactions.length >= limit) break;
+      }
+
+      if (interactions.length >= limit) {
+        nextCursor = cursor;
+        break;
+      }
+      if (records.length < CONTRACT_INTERACTIONS_PAGE_SIZE) {
+        nextCursor = null;
+        break;
+      }
+      // Scan budget exhausted: let the caller resume from where we stopped.
+      nextCursor = cursor;
+    }
+
+    return success(res, {
+      accountId: id,
+      interactions,
+      total: interactions.length,
+      limit,
+      cursor: nextCursor || null,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);

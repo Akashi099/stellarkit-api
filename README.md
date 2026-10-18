@@ -120,6 +120,8 @@ This project is ideal for:
 | GET | `/account/:id/funding-history` | Initial funding sources sorted by amount descending | — |
 | GET | `/account/:id/volume` | Transaction volume by asset over a time period (default: 30 days, max: 90 days) | `days` (default: 30, max: 90) |
 | GET | `/account/:id/risk-score` | Computed risk score and contributing factors | — |
+| GET | `/account/:id/fee-spending` | Network fees paid, broken down by operation type | `days` (default: 30, max: 90) |
+| GET | `/account/:id/smart-contract-interactions` | Soroban contract calls (contractId, function, timestamp, success) | `limit`, `cursor` |
 | GET | `/account/:id/freeze-status/:assetCode/:assetIssuer` | Check if an asset is frozen on an account | — |
 | GET | `/account/:id/can-receive/:assetCode/:assetIssuer` | Check if an account can receive a specific asset | — |
 | GET | `/account/:id/signers` | Account signers, their weights, and threshold configuration | — |
@@ -158,6 +160,7 @@ This project is ideal for:
 | Method | Path | Description | Query Params |
 | ------ | ---- | ----------- | ------------ |
 | GET | `/dex/price/:sellAsset/:buyAsset` | Effective exchange rate via best DEX path | `amount` |
+| GET | `/dex/best-path/:sourceAsset/:destAsset` | Optimal conversion path with estimated rate, slippage, and hops | `amount` |
 | GET | `/dex/spread/:sellAsset/:buyAsset` | Bid-ask spread for a trading pair | — |
 | GET | `/dex/depth/:sellAsset/:buyAsset` | Full order book depth analysis | — |
 | GET | `/dex/imbalance/:sellAsset/:buyAsset` | Buy/sell pressure imbalance detection | — |
@@ -208,6 +211,7 @@ This project is ideal for:
 | GET | `/utils/ledger-date` | Estimate close date for a ledger sequence | `sequence` |
 | GET | `/utils/keypair` | Generate a random testnet keypair | — |
 | POST | `/utils/decode-xdr` | Decode a transaction XDR envelope to JSON | Body: `xdr` |
+| POST | `/utils/decode-transaction` | Human-readable transaction breakdown (fee, source, sequence, time bounds, memo, operations) | Body: `xdr` |
 
 ### Cache
 
