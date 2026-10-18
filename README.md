@@ -56,6 +56,7 @@ This project is ideal for:
 - [Batch Endpoints Guide](docs/batch-endpoints.md) - Batch trust-status, freeze-status, and transaction status APIs, limits, and when to use batch vs individual
 - [DEX Endpoints Guide](docs/dex-endpoints.md) - All six DEX endpoints with curl examples, sample responses, and guidance on spread vs depth vs imbalance vs arbitrage
 - [Compliance Endpoints Guide](docs/compliance-endpoints.md) - All compliance and risk endpoints with curl examples, sample responses, and a complete compliance workflow
+- [Compliance Workflow Guide](docs/compliance-workflow.md) - Step-by-step KYC/AML workflow chaining risk score, watchlist, transaction velocity, compliance check, and freeze check into a compliance report
 - [Network Endpoints Guide](docs/network-endpoints.md) - All network and fee endpoints with curl examples, cache TTLs, and sample responses
 - [Caching Strategy](docs/caching-strategy.md) - Per-endpoint cache TTLs and configuration
 - [Logging Guide](docs/logging.md) - Log levels, configuration, structured log entry fields, JSON parsing, and production monitoring
@@ -111,6 +112,7 @@ This project is ideal for:
 | GET | `/account/:id/funding-history` | Account funding sources with sender, amount, asset, and timestamp | — |
 | GET | `/account/:id/trades` | DEX trades for the account | `limit`, `order`, `cursor`, `fresh` |
 | GET | `/account/:id/offers` | Open DEX offers for an account | `limit`, `cursor` |
+| GET | `/account/:id/offers-summary` | Open offer totals per asset (sell locked, buy committed) and oldest offer age; cached | `fresh` |
 | GET | `/account/:id/offer-history` | Historical offer operations | `limit`, `order`, `cursor` |
 | GET | `/account/:id/analytics` | Account activity analytics: transaction frequency, first/last seen timestamps, and average transactions per day | — |
 | GET | `/account/:id/transaction-count` | Total transaction count, first and last transaction timestamps | — |
@@ -127,6 +129,7 @@ This project is ideal for:
 | GET | `/account/:id/claimable-balances/eligible` | Evaluates every claimable balance where the account is a claimant and categorises each as eligible, not yet claimable, or expired. See the [Claimable Balances](#understanding-claimable-balances) section for details. | `limit`, `cursor`, `order`, `fresh` |
 | GET | `/account/:id/pool-positions` | Liquidity pool positions and share values | — |
 | GET | `/account/:id/counterparties` | Frequent payment counterparties | — |
+| GET | `/account/:id/payment-counterparty-risk` | Top payment counterparties by txCount with a risk level (`low`/`medium`/`high`) and risk factors for each | `limit` (default 10, max 20) |
 | GET | `/account/:id/transactions/search` | Search transactions by memo content | `memo`, `memo_type`, `limit`, `cursor`, `order` |
 | POST | `/account/:id/multisig-plan` | Signer combinations for each threshold | Body: `availableSigners` |
 
@@ -160,6 +163,7 @@ This project is ideal for:
 | GET | `/dex/imbalance/:sellAsset/:buyAsset` | Buy/sell pressure imbalance detection | — |
 | GET | `/dex/arbitrage/:assetCode/:assetIssuer` | Circular arbitrage path discovery | — |
 | GET | `/dex/top-markets` | Top markets ranked by recent trade activity | `limit` |
+| GET | `/dex/volume-leaders` | Top assets ranked by 24h trading volume against XLM (5 min cache) | `limit` (default 10, max 50) |
 | GET | `/dex/pool-share-value/:poolId/:shares` | Calculate the equivalent value of pool shares in both reserve assets | — |
 
 ### Liquidity Pools

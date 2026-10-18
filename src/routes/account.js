@@ -5331,6 +5331,284 @@ router.get("/:id/portfolio", async (req, res, next) => {
 });
 
 /**
+ * Runs a lightweight risk assessment on a single payment counterparty.
+ * Uses the same signals as /risk-score (age, home domain, trustline count)
+ * plus frozen-trustline and missing-account checks.
+ *
+ * @param {string} address - Counterparty public key.
+ * @returns {Promise<{ riskLevel: "low"|"medium"|"high", riskFactors: string[] }>}
+ */
+async function assessCounterpartyRisk(address) {
+  let account;
+  try {
+    account = await server.loadAccount(address);
+  } catch (err) {
+    if (err && err.response && err.response.status === 404) {
+      return {
+        riskLevel: "high",
+        riskFactors: ["Counterparty account does not exist or has been merged"],
+      };
+    }
+    throw err;
+  }
+
+  const riskFactors = [];
+  let score = 50;
+
+  let firstOp = null;
+  try {
+    const firstOpResponse = await server
+      .operations()
+      .forAccount(address)
+      .order("asc")
+      .limit(1)
+      .call();
+    firstOp = (firstOpResponse.records || [])[0] || null;
+  } catch (_) {
+    firstOp = null;
+  }
+
+  if (firstOp && firstOp.created_at) {
+    const daysOld = Math.floor(
+      (Date.now() - new Date(firstOp.created_at).getTime()) / (1000 * 60 * 60 * 24)
+    );
+    if (daysOld > 365) score += 15;
+    else if (daysOld > 30) score += 10;
+    else {
+      score -= 15;
+      riskFactors.push(`Account is very new (${daysOld} days old)`);
+    }
+  } else {
+    score -= 10;
+    riskFactors.push("No operation history found");
+  }
+
+  if (account.home_domain) score += 10;
+  else {
+    score -= 5;
+    riskFactors.push("No home domain configured");
+  }
+
+  const trustlines = (account.balances || []).filter((b) => isNonNativeAsset(b));
+  if (trustlines.length > 30) {
+    score -= 15;
+    riskFactors.push(`High number of trustlines (${trustlines.length})`);
+  } else if (trustlines.length > 10) {
+    score -= 5;
+  } else {
+    score += 5;
+  }
+
+  const frozenCount = trustlines.filter((b) => b.is_authorized === false).length;
+  if (frozenCount > 0) {
+    score -= 20;
+    riskFactors.push(`${frozenCount} frozen trustline(s)`);
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let riskLevel;
+  if (score >= 70) riskLevel = "low";
+  else if (score >= 40) riskLevel = "medium";
+  else riskLevel = "high";
+
+  return { riskLevel, riskFactors };
+}
+
+/**
+ * Returns the counterparty address of a payment-like operation relative to
+ * `accountId`, or null when the operation has no external counterparty.
+ */
+function getPaymentCounterparty(op, accountId) {
+  let counterparty = null;
+  if (op.type === "create_account") {
+    counterparty = op.funder === accountId ? op.account : op.funder;
+  } else if (op.type === "account_merge") {
+    counterparty = op.account === accountId ? op.into : op.account;
+  } else if (op.from || op.to) {
+    counterparty = op.from === accountId ? op.to : op.from;
+  }
+  return counterparty && counterparty !== accountId ? counterparty : null;
+}
+
+/**
+ * GET /account/:id/payment-counterparty-risk
+ *
+ * Fetches the account's most frequent payment counterparties and runs a
+ * risk assessment on each one.
+ *
+ * Query params:
+ *   - limit (number, default: 10, capped at 20)
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     counterparties: [{ address, txCount, riskLevel, riskFactors }]
+ *   }
+ *
+ * Counterparties are sorted by txCount descending. Returns 404 when the
+ * account does not exist.
+ *
+ * @example
+ * GET /account/GABC.../payment-counterparty-risk?limit=5
+ */
+router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const MAX_LIMIT = 20;
+    const DEFAULT_LIMIT = 10;
+    let limit = DEFAULT_LIMIT;
+    if (req.query.limit !== undefined) {
+      const parsed = parseInt(req.query.limit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        validateLimit(req.query.limit, MAX_LIMIT);
+      }
+      limit = Math.min(parsed, MAX_LIMIT);
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const paymentsResponse = await server
+      .payments()
+      .forAccount(id)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const counts = new Map();
+    for (const op of paymentsResponse.records || []) {
+      const counterparty = getPaymentCounterparty(op, id);
+      if (!counterparty) continue;
+      counts.set(counterparty, (counts.get(counterparty) || 0) + 1);
+    }
+
+    const top = Array.from(counts.entries())
+      .map(([address, txCount]) => ({ address, txCount }))
+      .sort((a, b) => b.txCount - a.txCount)
+      .slice(0, limit);
+
+    const counterparties = await Promise.all(
+      top.map(async ({ address, txCount }) => {
+        const { riskLevel, riskFactors } = await assessCounterpartyRisk(address);
+        return { address, txCount, riskLevel, riskFactors };
+      }),
+    );
+
+    return success(res, {
+      accountId: id,
+      counterparties,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/offers-summary
+ *
+ * Aggregates an account's open DEX offers per asset: total amount locked on
+ * the selling side and total amount committed on the buying side, plus the
+ * age of the oldest offer.
+ *
+ * Responses are cached per account (X-Cache: HIT | MISS). Pass ?fresh=true
+ * to bypass the cache.
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     offerCount: number,
+ *     assets: [{ asset, sellLocked, buyCommitted }],  // seven-decimal strings
+ *     oldestOfferAgeDays: number | null
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../offers-summary
+ */
+router.get("/:id/offers-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `offers-summary:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server
+      .offers()
+      .forAccount(id)
+      .limit(200)
+      .order("desc")
+      .call();
+    const records = offersResponse.records || [];
+
+    const assetTotals = new Map();
+    const getEntry = (code, issuer, type) => {
+      const asset = normalizeAsset(code, issuer, type);
+      const key = `${asset.code}:${asset.issuer}`;
+      if (!assetTotals.has(key)) {
+        assetTotals.set(key, { asset, sellLocked: 0, buyCommitted: 0 });
+      }
+      return assetTotals.get(key);
+    };
+
+    let oldestOfferTime = null;
+    for (const offer of records) {
+      const amount = parseFloat(offer.amount || "0");
+      const price = parseFloat(offer.price || "0");
+
+      getEntry(
+        offer.selling_asset_code,
+        offer.selling_asset_issuer,
+        offer.selling_asset_type,
+      ).sellLocked += amount;
+      getEntry(
+        offer.buying_asset_code,
+        offer.buying_asset_issuer,
+        offer.buying_asset_type,
+      ).buyCommitted += amount * price;
+
+      const modified = offer.last_modified_time
+        ? new Date(offer.last_modified_time).getTime()
+        : NaN;
+      if (Number.isFinite(modified) && (oldestOfferTime === null || modified < oldestOfferTime)) {
+        oldestOfferTime = modified;
+      }
+    }
+
+    const data = {
+      accountId: id,
+      offerCount: records.length,
+      assets: Array.from(assetTotals.values()).map((entry) => ({
+        asset: entry.asset,
+        sellLocked: toSevenDecimalString(entry.sellLocked),
+        buyCommitted: toSevenDecimalString(entry.buyCommitted),
+      })),
+      oldestOfferAgeDays:
+        oldestOfferTime === null
+          ? null
+          : Math.floor((Date.now() - oldestOfferTime) / (1000 * 60 * 60 * 24)),
+    };
+
+    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/watchlist-status
  *
  * Checks whether an account appears on any community-maintained Stellar
