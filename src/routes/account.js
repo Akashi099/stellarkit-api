@@ -3767,6 +3767,95 @@ router.get("/:id/payment-summary", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/asset-received-summary
+ *
+ * Aggregates lifetime inbound payment volume by asset, including the number
+ * of distinct senders and the first/last received timestamps.
+ */
+router.get("/:id/asset-received-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const receivedByAsset = new Map();
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("asc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+      if (records.length === 0) break;
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (op.transaction_successful === false) continue;
+
+        const isCreateAccount = op.type === "create_account";
+        const isPayment = [
+          "payment",
+          "path_payment_strict_receive",
+          "path_payment_strict_send",
+        ].includes(op.type);
+        if (!isCreateAccount && !isPayment) continue;
+
+        const sender = isCreateAccount ? op.funder : op.from;
+        const recipient = isCreateAccount ? op.account : op.to;
+        if (recipient !== id || !sender || sender === id) continue;
+
+        const amount = Number(op.amount || op.starting_balance || 0);
+        if (!Number.isFinite(amount) || amount <= 0) continue;
+
+        const assetCode = isCreateAccount ? "XLM" : op.asset_code || "XLM";
+        const assetIssuer = isCreateAccount ? null : op.asset_issuer || null;
+        const assetType = isCreateAccount
+          ? "native"
+          : op.asset_type || (assetCode === "XLM" ? "native" : null);
+        const assetKey = assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode;
+        const timestamp = new Date(op.created_at);
+        if (Number.isNaN(timestamp.getTime())) continue;
+
+        let summary = receivedByAsset.get(assetKey);
+        if (!summary) {
+          summary = {
+            asset: normalizeAsset(assetCode, assetIssuer, assetType),
+            totalReceived: 0,
+            senders: new Set(),
+            firstReceivedAt: timestamp,
+            lastReceivedAt: timestamp,
+          };
+          receivedByAsset.set(assetKey, summary);
+        }
+
+        summary.totalReceived += amount;
+        summary.senders.add(sender);
+        if (timestamp < summary.firstReceivedAt) summary.firstReceivedAt = timestamp;
+        if (timestamp > summary.lastReceivedAt) summary.lastReceivedAt = timestamp;
+      }
+
+      if (records.length < 200) break;
+    }
+
+    const summary = Array.from(receivedByAsset.values())
+      .filter((entry) => entry.totalReceived > 0)
+      .map((entry) => ({
+        asset: entry.asset,
+        totalReceived: entry.totalReceived.toFixed(7),
+        senderCount: entry.senders.size,
+        firstReceivedAt: entry.firstReceivedAt.toISOString(),
+        lastReceivedAt: entry.lastReceivedAt.toISOString(),
+      }))
+      .sort((a, b) => Number(b.totalReceived) - Number(a.totalReceived));
+
+    return success(res, { accountId: id, summary });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/summary
  *
  * Returns a compact, aggregated account summary suitable for dashboards

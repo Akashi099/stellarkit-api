@@ -834,6 +834,74 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
 });
 
 /**
+ * GET /asset/:code/:issuer/trading-volume
+ *
+ * Returns the asset's traded volume, trade count, and distinct traders over
+ * the last 24 hours.
+ */
+router.get("/:code/:issuer/trading-volume", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const asset = new Asset(assetCode, issuer);
+    const windowStartMs = Date.now() - 24 * 60 * 60 * 1000;
+    const traders = new Set();
+    let volume = 0;
+    let tradeCount = 0;
+    let cursor;
+    let done = false;
+
+    while (!done) {
+      let query = server.trades().forAsset(asset).order("desc").limit(200);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await query.call();
+      const records = response.records || [];
+      if (records.length === 0) break;
+
+      for (const trade of records) {
+        cursor = trade.paging_token;
+        const timestamp = new Date(trade.ledger_close_time).getTime();
+        if (!Number.isFinite(timestamp)) continue;
+        if (timestamp < windowStartMs) {
+          done = true;
+          break;
+        }
+
+        const isBaseAsset =
+          trade.base_asset_code?.toUpperCase() === assetCode &&
+          trade.base_asset_issuer === issuer;
+        const isCounterAsset =
+          trade.counter_asset_code?.toUpperCase() === assetCode &&
+          trade.counter_asset_issuer === issuer;
+        if (!isBaseAsset && !isCounterAsset) continue;
+
+        const amount = Number(
+          isBaseAsset ? trade.base_amount : trade.counter_amount,
+        );
+        if (Number.isFinite(amount)) volume += amount;
+        tradeCount += 1;
+        if (trade.base_account) traders.add(trade.base_account);
+        if (trade.counter_account) traders.add(trade.counter_account);
+      }
+
+      if (done || records.length < 200 || !cursor) break;
+    }
+
+    return success(res, {
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+      volume24h: volume.toFixed(7),
+      tradeCount24h: tradeCount,
+      uniqueTraders24h: traders.size,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * GET /asset/:code/:issuer/issuance-history
  *
  * Returns a time series of supply changes for an asset over a specified time period.
