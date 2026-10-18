@@ -51,6 +51,7 @@ This project is ideal for:
 - [API Design Guidelines](docs/api-design.md) - Design conventions and response patterns
 - [Response Format Guide](docs/response-format.md) - Standard response envelopes, pagination, and data formats
 - [Streaming Guide](docs/streaming.md) - SSE and WebSocket streaming endpoints, event payloads, reconnection, and clean close handling
+- [Real-Time Guide](docs/real-time-guide.md) - Build real-time Stellar apps by combining SSE/WebSocket streams with REST calls and polling, handling interruptions, and a complete Node.js balance monitor
 - [Webhooks Guide](docs/webhooks.md) - Register webhooks, available events, payload shapes, signature verification, retries, and unregistration
 - [Webhook Security Guide](docs/webhook-security.md) - Verify HMAC-SHA256 delivery signatures in Node.js/Python/Go, handle invalid signatures, store secrets safely, and rotate with the dual-secret pattern
 - [Batch Endpoints Guide](docs/batch-endpoints.md) - Batch trust-status, freeze-status, and transaction status APIs, limits, and when to use batch vs individual
@@ -126,6 +127,9 @@ This project is ideal for:
 | GET | `/account/:id/sponsorships` | **Preferred.** Typed sponsorship summary with `sponsoredBy` and `sponsoring` arrays; each entry includes `type`, `address`, `sponsor`, and `reserveAmount`. More structured than `/sponsorship`. Note: will be consolidated with `/sponsorship` in a future release (see issue #19). | — |
 | GET | `/account/:id/claimable-balances/eligible` | Evaluates every claimable balance where the account is a claimant and categorises each as eligible, not yet claimable, or expired. See the [Claimable Balances](#understanding-claimable-balances) section for details. | `limit`, `cursor`, `order`, `fresh` |
 | GET | `/account/:id/pool-positions` | Liquidity pool positions and share values | — |
+| GET | `/account/:id/liquidity-contribution` | Liquidity pool contributions per pool and totals per asset (cached) | `fresh` |
+| GET | `/account/:id/pending-effects` | Submitted operations that have not yet produced confirmed effects (never cached) | — |
+| GET | `/account/:id/historical-balances` | Balance snapshots over time reconstructed from payment and trade history | `asset` (`CODE:ISSUER`, default XLM), `resolution` (`7d`\|`30d`, default `7d`) |
 | GET | `/account/:id/counterparties` | Frequent payment counterparties | — |
 | GET | `/account/:id/transactions/search` | Search transactions by memo content | `memo`, `memo_type`, `limit`, `cursor`, `order` |
 | POST | `/account/:id/multisig-plan` | Signer combinations for each threshold | Body: `availableSigners` |
