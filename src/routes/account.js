@@ -4183,6 +4183,437 @@ router.get("/:id/pool-positions", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/liquidity-contribution
+ *
+ * Aggregates the account's liquidity pool positions into a single view of how
+ * much of each asset the account is contributing across all pools it holds
+ * shares in.
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     pools: [{ poolId, shares, sharePercent, reserves: [{ asset, amount }] }],
+ *     totalsByAsset: [{ asset, amount }],
+ *     poolCount: number
+ *   }
+ *
+ * Cached per account for `cacheTTL.liquidityContribution` seconds.
+ * Pass ?fresh=true to bypass the cache.
+ */
+router.get("/:id/liquidity-contribution", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+    const cacheKey = `liquidity-contribution:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const poolShareTrustlines = (account.balances || []).filter(
+      (balance) => balance.asset_type === "liquidity_pool_shares",
+    );
+
+    const poolDetails = await Promise.all(
+      poolShareTrustlines.map((trustline) =>
+        server
+          .liquidityPools()
+          .liquidityPoolId(trustline.liquidity_pool_id)
+          .call()
+          .catch((err) => {
+            if (err && err.response && err.response.status === 404) return null;
+            throw err;
+          }),
+      ),
+    );
+
+    const pools = [];
+    const totals = new Map();
+
+    poolShareTrustlines.forEach((trustline, i) => {
+      const pool = poolDetails[i];
+      if (!pool) return;
+
+      const accountShares = parseFloat(trustline.balance);
+      const totalShares = parseFloat(pool.total_shares);
+      const ratio = totalShares > 0 ? accountShares / totalShares : 0;
+
+      const reserves = (pool.reserves || []).map((reserve) => {
+        const asset = normalizeAssetFromString(reserve.asset);
+        const amount = parseFloat(reserve.amount) * ratio;
+        const key = asset.issuer ? `${asset.code}:${asset.issuer}` : asset.code;
+        const existing = totals.get(key);
+        if (existing) existing.amount += amount;
+        else totals.set(key, { asset, amount });
+        return { asset, amount: toSevenDecimalString(amount) };
+      });
+
+      pools.push({
+        poolId: pool.id,
+        shares: toSevenDecimalString(accountShares),
+        sharePercent: toSevenDecimalString(ratio * 100),
+        reserves,
+      });
+    });
+
+    const data = {
+      accountId: id,
+      pools,
+      totalsByAsset: Array.from(totals.values()).map((t) => ({
+        asset: t.asset,
+        amount: toSevenDecimalString(t.amount),
+      })),
+      poolCount: pools.length,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.liquidityContribution);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Extracts the ledger sequence encoded in a Horizon operation ID.
+ * Horizon operation IDs are TOIDs: the ledger sequence occupies the high 32 bits.
+ *
+ * @param {string} operationId
+ * @returns {number|null}
+ */
+function ledgerFromOperationId(operationId) {
+  try {
+    return Number(BigInt(operationId) >> 32n);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * GET /account/:id/pending-effects
+ *
+ * Returns operations the account has submitted that have not yet produced
+ * confirmed effects. Effects are emitted in ledger order, so any successful
+ * operation newer than the account's most recent effect is still pending.
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     pendingEffects: [{ operationId, operationType, transactionHash, estimatedLedger, submittedAt }],
+ *     count: number
+ *   }
+ *
+ * Never cached — pending state changes every few seconds. The response is sent
+ * with `Cache-Control: no-store` and is not stored in the cache service.
+ */
+router.get("/:id/pending-effects", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    res.set("Cache-Control", "no-store");
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const [latestLedgerPage, operationsPage, effectsPage] = await withHorizonTiming(
+      req,
+      () =>
+        Promise.all([
+          server.ledgers().order("desc").limit(1).call(),
+          server.operations().forAccount(id).order("desc").limit(50).call(),
+          server.effects().forAccount(id).order("desc").limit(1).call(),
+        ]),
+    );
+
+    const latestLedger = (latestLedgerPage.records || [])[0];
+    const nextLedger = latestLedger ? Number(latestLedger.sequence) + 1 : null;
+
+    // Effect paging tokens are "<operationId>-<index>".
+    const latestEffect = (effectsPage.records || [])[0];
+    let latestEffectOpId = null;
+    if (latestEffect && latestEffect.paging_token) {
+      try {
+        latestEffectOpId = BigInt(String(latestEffect.paging_token).split("-")[0]);
+      } catch (_) {
+        latestEffectOpId = null;
+      }
+    }
+
+    const pendingEffects = [];
+    for (const op of operationsPage.records || []) {
+      // Failed operations never produce effects, so they are not pending.
+      if (op.transaction_successful === false) continue;
+
+      let opId;
+      try {
+        opId = BigInt(op.id);
+      } catch (_) {
+        continue;
+      }
+      if (latestEffectOpId !== null && opId <= latestEffectOpId) break;
+
+      pendingEffects.push({
+        operationId: op.id,
+        operationType: op.type,
+        transactionHash: op.transaction_hash || null,
+        estimatedLedger: ledgerFromOperationId(op.id) || nextLedger,
+        submittedAt: op.created_at ? toISOTimestamp(op.created_at) : null,
+      });
+    }
+
+    return success(res, {
+      accountId: id,
+      pendingEffects,
+      count: pendingEffects.length,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const HISTORICAL_BALANCE_RESOLUTIONS = { "7d": 7, "30d": 30 };
+const HISTORICAL_BALANCE_SNAPSHOTS = 12;
+const HISTORICAL_BALANCE_MAX_PAGES = 10;
+
+/**
+ * Parses the ?asset= query param for /historical-balances.
+ * Accepts "native", "XLM" or "CODE:ISSUER". Defaults to native XLM.
+ *
+ * @param {string|undefined} raw
+ * @returns {{ code: string, issuer: string|null, type: string }}
+ */
+function parseHistoricalBalanceAsset(raw) {
+  if (raw === undefined || raw === "") {
+    return { code: "XLM", issuer: null, type: "native" };
+  }
+  const value = String(raw);
+  if (value.toLowerCase() === "native" || value.toUpperCase() === "XLM") {
+    return { code: "XLM", issuer: null, type: "native" };
+  }
+  const parts = value.split(":");
+  if (parts.length !== 2) {
+    const err = new Error(
+      "Query parameter 'asset': must be 'native' or in the format CODE:ISSUER.",
+    );
+    err.isValidation = true;
+    err.status = 400;
+    err.field = "asset";
+    err.receivedValue = value;
+    err.expectedFormat = "CODE:ISSUER";
+    throw err;
+  }
+  const [code, issuer] = parts;
+  if (code.toUpperCase() === "XLM" && issuer.toLowerCase() === "native") {
+    return { code: "XLM", issuer: null, type: "native" };
+  }
+  validateAssetCode(code);
+  validateAccountId(issuer);
+  return normalizeAsset(code.toUpperCase(), issuer);
+}
+
+function sameAsset(a, b) {
+  if (a.type === "native" || b.type === "native") {
+    return a.type === "native" && b.type === "native";
+  }
+  return a.code === b.code && a.issuer === b.issuer;
+}
+
+/**
+ * Pages through a Horizon collection (newest first) until records older than
+ * `since` are reached, or HISTORICAL_BALANCE_MAX_PAGES pages have been read.
+ */
+async function fetchRecordsSince(buildQuery, since, timeField) {
+  const records = [];
+  let cursor;
+  for (let page = 0; page < HISTORICAL_BALANCE_MAX_PAGES; page++) {
+    let query = buildQuery().limit(200).order("desc");
+    if (cursor) query = query.cursor(cursor);
+    const response = await query.call();
+    const pageRecords = response.records || [];
+    let reachedEnd = false;
+    for (const record of pageRecords) {
+      cursor = record.paging_token;
+      if (new Date(record[timeField]) < since) {
+        reachedEnd = true;
+        break;
+      }
+      records.push(record);
+    }
+    if (reachedEnd || pageRecords.length < 200) break;
+  }
+  return records;
+}
+
+/**
+ * Returns the signed balance change (in asset units) a payment-type
+ * operation applied to `accountId` for `asset`.
+ */
+function paymentDelta(op, accountId, asset) {
+  if (op.transaction_successful === false) return 0;
+
+  if (op.type === "create_account") {
+    if (asset.type !== "native") return 0;
+    const amount = parseFloat(op.starting_balance || "0");
+    if (op.account === accountId) return amount;
+    if (op.funder === accountId) return -amount;
+    return 0;
+  }
+
+  if (
+    op.type !== "payment" &&
+    op.type !== "path_payment_strict_send" &&
+    op.type !== "path_payment_strict_receive"
+  ) {
+    return 0;
+  }
+
+  let delta = 0;
+  const destAsset = normalizeAsset(op.asset_code, op.asset_issuer, op.asset_type);
+  if (op.to === accountId && sameAsset(destAsset, asset)) {
+    delta += parseFloat(op.amount || "0");
+  }
+  if (op.from === accountId) {
+    const isPath = op.type !== "payment";
+    const sentAsset = isPath
+      ? normalizeAsset(op.source_asset_code, op.source_asset_issuer, op.source_asset_type)
+      : destAsset;
+    if (sameAsset(sentAsset, asset)) {
+      delta -= parseFloat((isPath ? op.source_amount : op.amount) || "0");
+    }
+  }
+  return delta;
+}
+
+/**
+ * Returns the signed balance change (in asset units) a trade applied to
+ * `accountId` for `asset`.
+ */
+function tradeDelta(trade, accountId, asset) {
+  if (trade.base_account !== accountId && trade.counter_account !== accountId) {
+    return 0;
+  }
+  const mapped = mapAccountTrade(trade, accountId);
+  let delta = 0;
+  if (sameAsset(mapped.buying, asset)) delta += parseFloat(mapped.boughtAmount);
+  if (sameAsset(mapped.selling, asset)) delta -= parseFloat(mapped.soldAmount);
+  return delta;
+}
+
+/**
+ * GET /account/:id/historical-balances
+ *
+ * Reconstructs balance snapshots at regular intervals by starting from the
+ * account's current balance and replaying its payment and trade history
+ * backwards in time.
+ *
+ * Query params:
+ *   - asset      ("native" | "CODE:ISSUER", default: native XLM)
+ *   - resolution ("7d" | "30d", default: "7d") — interval between snapshots
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     asset: { code, issuer, type },
+ *     resolution: "7d" | "30d",
+ *     snapshots: [{ timestamp: string, balance: string }]  // oldest first
+ *   }
+ *
+ * Snapshots are approximations: transaction fees and balance changes from
+ * operations other than payments and trades (e.g. claimable balances, pool
+ * deposits) are not replayed.
+ */
+router.get("/:id/historical-balances", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const resolution = req.query.resolution === undefined
+      ? "7d"
+      : String(req.query.resolution);
+    if (!Object.prototype.hasOwnProperty.call(HISTORICAL_BALANCE_RESOLUTIONS, resolution)) {
+      const err = new Error(
+        "Query parameter 'resolution': must be one of 7d, 30d.",
+      );
+      err.isValidation = true;
+      err.status = 400;
+      err.field = "resolution";
+      err.receivedValue = resolution;
+      err.expectedFormat = "7d | 30d";
+      throw err;
+    }
+
+    const asset = parseHistoricalBalanceAsset(req.query.asset);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const holding = (account.balances || []).find((b) =>
+      asset.type === "native"
+        ? isNativeAsset(b)
+        : b.asset_code === asset.code && b.asset_issuer === asset.issuer,
+    );
+    const currentBalance = holding ? parseFloat(holding.balance) : 0;
+
+    const intervalMs = HISTORICAL_BALANCE_RESOLUTIONS[resolution] * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const since = new Date(now - intervalMs * (HISTORICAL_BALANCE_SNAPSHOTS - 1));
+
+    const [payments, trades] = await withHorizonTiming(req, () =>
+      Promise.all([
+        fetchRecordsSince(() => server.payments().forAccount(id), since, "created_at"),
+        fetchRecordsSince(() => server.trades().forAccount(id), since, "ledger_close_time"),
+      ]),
+    );
+
+    const changes = [
+      ...payments.map((op) => ({
+        time: new Date(op.created_at).getTime(),
+        delta: paymentDelta(op, id, asset),
+      })),
+      ...trades.map((trade) => ({
+        time: new Date(trade.ledger_close_time).getTime(),
+        delta: tradeDelta(trade, id, asset),
+      })),
+    ]
+      .filter((c) => c.delta !== 0 && Number.isFinite(c.time))
+      .sort((a, b) => b.time - a.time);
+
+    // Walk backwards from now, undoing every change newer than each snapshot.
+    const snapshots = [];
+    let balance = currentBalance;
+    let idx = 0;
+    for (let i = 0; i < HISTORICAL_BALANCE_SNAPSHOTS; i++) {
+      const timestamp = now - intervalMs * i;
+      while (idx < changes.length && changes[idx].time > timestamp) {
+        balance -= changes[idx].delta;
+        idx++;
+      }
+      snapshots.push({
+        timestamp: new Date(timestamp).toISOString(),
+        balance: toSevenDecimalString(Math.max(balance, 0)),
+      });
+    }
+    snapshots.reverse();
+
+    return success(res, {
+      accountId: id,
+      asset,
+      resolution,
+      snapshots,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * POST /account/:id/multisig-plan
  */
 // GET /account/:id/transaction-stats

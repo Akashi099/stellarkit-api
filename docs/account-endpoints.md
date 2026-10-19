@@ -145,6 +145,48 @@ curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER
 
 ---
 
+### `GET /account/:id/historical-balances`
+
+Reconstructs balance snapshots at regular intervals by starting from the current balance and replaying payment and trade history backwards. Useful for portfolio charts and tax tools. Snapshots are approximations: transaction fees and balance changes from other operation types are not replayed.
+
+**Query params:**
+
+| Param | Type | Description |
+|---|---|---|
+| `asset` | string | `CODE:ISSUER` to track a single asset. Defaults to native XLM. |
+| `resolution` | string | Interval between snapshots: `7d` (default) or `30d`. Any other value returns `400`. |
+
+```bash
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/historical-balances?resolution=30d"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "accountId": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "asset": { "code": "XLM", "issuer": null, "type": "native" },
+    "resolution": "30d",
+    "snapshots": [
+      { "timestamp": "2025-11-22T10:00:00.000Z", "balance": "120.0000000" },
+      { "timestamp": "2026-10-18T10:00:00.000Z", "balance": "250.5000000" }
+    ]
+  }
+}
+```
+
+---
+
+### `GET /account/:id/liquidity-contribution`
+
+Aggregates the account's liquidity pool positions: per-pool share percentage and equivalent reserves, plus totals per asset across all pools. Cached per account (`CACHE_TTL_LIQUIDITY_CONTRIBUTION_MS`, default 15 s); responses carry `X-Cache: HIT|MISS`. Pass `?fresh=true` to bypass the cache.
+
+```bash
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/liquidity-contribution"
+```
+
+---
+
 ## Use case: Activity — transaction and payment history
 
 These endpoints let you page through an account's historical activity.
@@ -219,6 +261,35 @@ curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER
 
 # Only account_credited effects
 curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/effects?type=account_credited"
+```
+
+---
+
+### `GET /account/:id/pending-effects`
+
+Lists operations the account has submitted that have not yet produced confirmed effects. Each entry has `operationType`, `estimatedLedger` and `submittedAt`; `pendingEffects` is empty when nothing is pending. Returns `404` for unknown accounts. Never cached — the response is sent with `Cache-Control: no-store`.
+
+```bash
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/pending-effects"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "accountId": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "pendingEffects": [
+      {
+        "operationId": "225180887986176001",
+        "operationType": "payment",
+        "transactionHash": "3389e9f0f1a65f19736cacf544c2e825313e8447f569233bb8db39aa607c1234",
+        "estimatedLedger": 52430100,
+        "submittedAt": "2026-10-18T10:00:05.000Z"
+      }
+    ],
+    "count": 1
+  }
+}
 ```
 
 ---
