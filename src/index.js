@@ -404,6 +404,9 @@ app.get("/", (req, res) => {
         { method: "POST", path: "/account/:id/multisig-plan", description: "Plan multisig transactions by calculating signer combinations for each threshold" },
         { method: "POST", path: "/accounts/multisig-info", description: "Batch multisig configuration lookup for multiple accounts" },
         { method: "GET", path: "/account/:id/pool-positions", description: "Calculate liquidity pool positions and share values" },
+        { method: "GET", path: "/account/:id/liquidity-contribution", description: "Aggregate liquidity pool contributions by pool and asset" },
+        { method: "GET", path: "/account/:id/pending-effects", description: "Submitted operations that have not yet produced confirmed effects" },
+        { method: "GET", path: "/account/:id/historical-balances", description: "Balance snapshots over time reconstructed from payment and trade history" },
         { method: "GET", path: "/account/:id/transactions/search", description: "Search account transactions by memo content" },
         { method: "GET", path: "/account/:id/volume", description: "Total transaction volume by asset over a time period" },
         { method: "GET", path: "/transactions/:id", description: "Transaction history for an account" },
@@ -604,6 +607,21 @@ app.get("/", (req, res) => {
           method: "GET",
           path: "/account/:id/pool-positions",
           description: "Calculate liquidity pool positions and share values",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/liquidity-contribution",
+          description: "Aggregate liquidity pool contributions by pool and asset",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/pending-effects",
+          description: "Submitted operations that have not yet produced confirmed effects",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/historical-balances",
+          description: "Balance snapshots over time reconstructed from payment and trade history",
         },
         {
           method: "GET",
