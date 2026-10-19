@@ -73,6 +73,10 @@ This project is ideal for:
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
+- [Getting Started for Contributors](docs/getting-started-for-contributors.md) - First-time contributor walkthrough: environment setup, codebase orientation, response conventions, first test, and PR checklist
+- [Tax Reporting Guide](docs/tax-reporting-guide.md) - Gather Stellar tax inputs (transactions, trades, fee spending, historical balances, cross-asset conversions) and compute cost basis
+- [Analytics Endpoints Guide](docs/analytics-endpoints.md) - Account analytics endpoints grouped by activity, volume, and compliance use cases, with an account health dashboard example
+- [SEP-10 Authentication Guide](docs/sep10-authentication.md) - Complete SEP-10 challenge-response flow using StellarKit for discovery, preflight, and inspection, with Node.js signing example
 
 ---
 
