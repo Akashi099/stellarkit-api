@@ -1,13 +1,14 @@
 /**
  * tests/routes/account.offersSummary.test.js
  *
- * Cache coverage for GET /account/:id/offers-summary.
+ * Tests for GET /account/:id/offers-summary.
  *
  * Test scenarios:
- *   1. First request hits Horizon and returns X-Cache: MISS
- *   2. Second request returns X-Cache: HIT with identical data
- *   3. ?fresh=true forces a cache bypass
- *   4. Two different account IDs get separate cache entries
+ *   - Three sell offers for the same asset return one sellLocked entry with combined totalAmount
+ *   - oldestOfferAgeDays correctly identifies the oldest offer
+ *   - An account with no offers returns totalOffers: 0 and empty arrays
+ *   - A non-existent account returns a 404
+ *   - Caching behavior (first request misses, second hits)
  */
 
 "use strict";
@@ -28,19 +29,26 @@ const { server } = require("../../src/config/stellar");
 const cacheService = require("../../src/services/cache");
 
 const USDC_ISSUER = Keypair.random().publicKey();
+const BTC_ISSUER = Keypair.random().publicKey();
 
-function makeOffer(id, amount, price) {
+function makeOffer(id, amount, price, options = {}) {
+  const now = Date.now();
+  const daysAgo = options.daysAgo || 0;
+  const lastModifiedTime = new Date(now - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+
   return {
     id: String(id),
     paging_token: String(id),
     seller: "seller",
-    selling_asset_type: "native",
-    buying_asset_type: "credit_alphanum4",
-    buying_asset_code: "USDC",
-    buying_asset_issuer: USDC_ISSUER,
+    selling_asset_type: options.sellingAssetType || "native",
+    selling_asset_code: options.sellingAssetCode || null,
+    selling_asset_issuer: options.sellingAssetIssuer || null,
+    buying_asset_type: options.buyingAssetType || "credit_alphanum4",
+    buying_asset_code: options.buyingAssetCode || "USDC",
+    buying_asset_issuer: options.buyingAssetIssuer || USDC_ISSUER,
     amount,
     price,
-    last_modified_time: "2024-01-01T00:00:00Z",
+    last_modified_time: lastModifiedTime,
   };
 }
 
@@ -62,9 +70,11 @@ function mockOffers(recordsByAccount) {
   return forAccount;
 }
 
-describe("GET /account/:id/offers-summary cache behavior", () => {
+describe("GET /account/:id/offers-summary", () => {
   const accountA = Keypair.random().publicKey();
   const accountB = Keypair.random().publicKey();
+  const NONEXISTENT_ACCOUNT = Keypair.random().publicKey();
+  const HORIZON_404 = { response: { status: 404 } };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -72,6 +82,75 @@ describe("GET /account/:id/offers-summary cache behavior", () => {
     server.loadAccount.mockImplementation((id) => Promise.resolve({ id }));
   });
 
+  // --- Test: three sell offers for same asset combine into one sellLocked entry ---
+  it("three sell offers for the same asset return one sellLocked entry with combined totalAmount", async () => {
+    // Three offers selling XLM for USDC
+    const offers = [
+      makeOffer(1, "10.0000000", "0.5", { buyingAssetCode: "USDC", buyingAssetIssuer: USDC_ISSUER }),
+      makeOffer(2, "20.0000000", "0.5", { buyingAssetCode: "USDC", buyingAssetIssuer: USDC_ISSUER }),
+      makeOffer(3, "15.0000000", "0.5", { buyingAssetCode: "USDC", buyingAssetIssuer: USDC_ISSUER }),
+    ];
+    mockOffers({ [accountA]: offers });
+
+    const res = await request(app).get(`/account/${accountA}/offers-summary`);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.offerCount).toBe(3);
+
+    // Should have exactly one asset entry (USDC)
+    const usdcEntry = res.body.data.assets.find(
+      (a) => a.asset.code === "USDC" && a.asset.issuer === USDC_ISSUER
+    );
+    expect(usdcEntry).toBeDefined();
+    // Combined: 10 + 20 + 15 = 45
+    expect(usdcEntry.sellLocked).toBe("45.0000000");
+  });
+
+  // --- Test: oldestOfferAgeDays correctly identifies the oldest offer ---
+  it("oldestOfferAgeDays correctly identifies the oldest offer", async () => {
+    const now = Date.now();
+    // Offer 1: 5 days ago
+    const offer1 = makeOffer(1, "10.0000000", "0.5", { daysAgo: 5 });
+    // Offer 2: 30 days ago (oldest)
+    const offer2 = makeOffer(2, "20.0000000", "0.5", { daysAgo: 30 });
+    // Offer 3: 10 days ago
+    const offer3 = makeOffer(3, "15.0000000", "0.5", { daysAgo: 10 });
+
+    mockOffers({ [accountA]: [offer1, offer2, offer3] });
+
+    const res = await request(app).get(`/account/${accountA}/offers-summary`);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.oldestOfferAgeDays).toBeGreaterThanOrEqual(29);
+    expect(res.body.data.oldestOfferAgeDays).toBeLessThanOrEqual(31);
+  });
+
+  // --- Test: account with no offers returns empty arrays ---
+  it("account with no offers returns totalOffers: 0 and empty arrays", async () => {
+    mockOffers({ [accountA]: [] });
+
+    const res = await request(app).get(`/account/${accountA}/offers-summary`);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.offerCount).toBe(0);
+    expect(res.body.data.assets).toEqual([]);
+    expect(res.body.data.oldestOfferAgeDays).toBeNull();
+  });
+
+  // --- Test: non-existent account returns 404 ---
+  it("non-existent account returns a 404", async () => {
+    server.loadAccount.mockRejectedValue(HORIZON_404);
+
+    const res = await request(app).get(`/account/${NONEXISTENT_ACCOUNT}/offers-summary`);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.type).toBe("AccountNotFound");
+  });
+
+  // --- Cache behavior tests ---
   it("first request hits Horizon and returns X-Cache: MISS", async () => {
     const forAccount = mockOffers({ [accountA]: [makeOffer(1, "10.0000000", "0.5")] });
 
