@@ -28,6 +28,7 @@ Asset codes are case-insensitive (`xlm:native` and `XLM:native` both work).
 | GET | `/dex/imbalance/:sellAsset/:buyAsset` | Buy/sell pressure imbalance detection |
 | GET | `/dex/arbitrage/:assetCode/:assetIssuer` | Circular arbitrage path discovery |
 | GET | `/dex/top-markets` | Top markets ranked by recent trade activity |
+| GET | `/dex/volume-leaders` | Top assets ranked by 24h trading volume against XLM |
 
 ---
 
@@ -320,6 +321,54 @@ curl "http://localhost:3000/dex/top-markets?limit=5"
 ```
 
 `spread` is `null` when the order book for a pair has no active orders at query time.
+
+---
+
+## 7. `GET /dex/volume-leaders`
+
+Returns the most actively traded assets on the Stellar DEX, ranked by 24-hour trading volume against XLM. Volume is aggregated from the most recent 200 trades, keeping only XLM-paired trades from the last 24 hours. Responses are cached for 5 minutes (configurable via `CACHE_TTL_VOLUME_LEADERS_MS`).
+
+**When to use:** Market overview dashboards that need a ranked list of the busiest assets without querying each asset individually.
+
+**Query params:**
+
+| Param | Type | Default | Max |
+| ----- | ---- | ------- | --- |
+| `limit` | integer | `10` | `50` |
+
+**curl example:**
+
+```bash
+curl "http://localhost:3000/dex/volume-leaders?limit=5"
+```
+
+**Sample response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "leaders": [
+      {
+        "asset": {
+          "code": "USDC",
+          "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+          "type": "credit_alphanum4"
+        },
+        "volume24h": "540210.0000000",
+        "tradeCount": 84,
+        "priceChangePercent": "1.2500000",
+        "uniqueTraders": 37
+      }
+    ],
+    "updatedAt": "2026-10-18T12:00:00.000Z"
+  }
+}
+```
+
+- `volume24h` is the XLM-side volume as a seven-decimal string.
+- `priceChangePercent` compares the newest and oldest XLM price observed in the window; it is `null` when only one trade was seen.
+- `uniqueTraders` counts distinct buyer and seller accounts.
 
 ---
 

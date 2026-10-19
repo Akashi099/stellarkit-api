@@ -48,10 +48,10 @@ const { formatLedgerSequence } = require("../utils/formatLedgerSequence");
 
 
 const axios = require("axios");
-const { Asset } = require("@stellar/stellar-sdk");
+const { Asset, scValToNative, xdr } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
-const { getAssetMetadataFromToml } = require("../utils/tomlResolver");
+const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
 const { formatBalance } = require("../utils/formatBalance");
 const { parseStellarAmount } = require("../utils/parseStellarAmount");
 const { formatAmount } = require("../utils/formatAmount");
@@ -612,6 +612,57 @@ router.get("/:id/signing-keys", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/delegated-signers
+ * Returns additional account signers and whether each signer account is multisig.
+ */
+router.get("/:id/delegated-signers", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await server.loadAccount(id);
+    const delegatedSigners = (account.signers || []).filter(
+      (signer) =>
+        signer.key !== account.id &&
+        (!signer.type || normalizeSignerType(signer.type) === "ed25519_public_key"),
+    );
+
+    const resolvedSigners = await Promise.all(
+      delegatedSigners.map(async (signer) => {
+        const signerAccount = await server.loadAccount(signer.key);
+        const signerEntries = signerAccount.signers || [];
+        const masterSigner = signerEntries.find(
+          (entry) => entry.key === signerAccount.id,
+        );
+        const masterWeight = Number(
+          masterSigner?.weight ?? signerAccount.master_weight ?? 0,
+        );
+        const thresholds = signerAccount.thresholds || {};
+        const isMultisig =
+          signerEntries.length > 1 ||
+          Number(thresholds.low_threshold ?? 0) > masterWeight ||
+          Number(thresholds.med_threshold ?? 0) > masterWeight ||
+          Number(thresholds.high_threshold ?? 0) > masterWeight;
+
+        return {
+          key: signer.key,
+          weight: Number(signer.weight) || 0,
+          type: normalizeSignerType(signer.type),
+          isMultisig,
+        };
+      }),
+    );
+
+    return success(res, {
+      accountId: account.id,
+      delegatedSigners: resolvedSigners,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/multisig-info
  *
  * Returns a human-readable summary of an account's multisig configuration,
@@ -902,9 +953,14 @@ router.get("/:id/operations", async (req, res, next) => {
 
     return success(res, {
       operations,
-      total: operations.length,
-      limit,
-      cursor: operations.length ? nextCursor : null,
+    }, {
+      meta: {
+        count: operations.length,
+        limit,
+        order: "desc",
+        nextCursor: operations.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     if (err && err.response && err.response.status === 404) {
@@ -963,7 +1019,7 @@ router.get("/:id/payments", async (req, res, next) => {
       "subentry-health", "merge-eligibility", "offers", "payments",
       "operation-breakdown", "offer-history", "timeline", "data",
       "pool-positions", "risk-score", "trustline-health", "age", "volume",
-      "payment-summary", "operations",
+      "payment-summary", "net-flow", "operations",
     ];
     if (reservedWords.includes(id)) {
       return next();
@@ -1102,10 +1158,14 @@ router.get("/:id/payments", async (req, res, next) => {
 
     return success(res, {
       payments,
-      items: payments,
-      total: payments.length,
-      limit,
-      cursor: payments.length ? nextCursor : null,
+    }, {
+      meta: {
+        count: payments.length,
+        limit,
+        order,
+        nextCursor: payments.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
@@ -1196,15 +1256,21 @@ router.get("/:id/trades", async (req, res, next) => {
 
     const data = {
       trades,
-      items: trades,
-      total: trades.length,
-      limit,
-      cursor: trades.length ? nextCursor : null,
     };
 
-    cacheService.set(cacheKey, data, cacheTTL.trades);
+    const metadata = {
+      meta: {
+        count: trades.length,
+        limit,
+        order,
+        nextCursor: trades.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
+    };
+
+    cacheService.set(cacheKey, { ...data, ...metadata }, cacheTTL.trades);
     res.set("X-Cache", "MISS");
-    return success(res, data);
+    return success(res, data, metadata);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -1324,9 +1390,14 @@ router.get("/:id/offers", async (req, res, next) => {
     return success(res, {
       offers,
       items: offers,
-      total: offers.length,
-      limit,
-      cursor: nextCursor,
+    }, {
+      meta: {
+        count: offers.length,
+        limit,
+        order: "desc",
+        nextCursor: nextCursor || null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     if (req.query.offerId) {
@@ -1989,6 +2060,327 @@ router.get("/:id/analytics", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/stale-offers
+ *
+ * Returns all open DEX offers for an account with staleness analysis.
+ * Each offer's price is compared against the current mid-market price from
+ * the Horizon order book. Offers where the price deviation exceeds the
+ * configured threshold are flagged as stale.
+ *
+ * Query params:
+ *   - threshold (number, default: 5) — deviation % above which an offer is stale
+ *
+ * Returns 404 when the account does not exist.
+ */
+router.get("/:id/stale-offers", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const rawThreshold = req.query.threshold !== undefined ? parseFloat(req.query.threshold) : 5;
+    const threshold = Number.isFinite(rawThreshold) && rawThreshold >= 0 ? rawThreshold : 5;
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server.offers().forAccount(id).limit(200).order("desc").call();
+    const offerRecords = offersResponse.records || [];
+
+    const offers = await Promise.all(offerRecords.map(async (offer) => {
+      const sellingAsset = offer.selling_asset_type === "native"
+        ? Asset.native()
+        : new Asset(offer.selling_asset_code, offer.selling_asset_issuer);
+      const buyingAsset = offer.buying_asset_type === "native"
+        ? Asset.native()
+        : new Asset(offer.buying_asset_code, offer.buying_asset_issuer);
+
+      let offerPrice;
+      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+        offerPrice = Number(offer.price_r.n) / Number(offer.price_r.d);
+      } else {
+        offerPrice = parseFloat(offer.price || "0");
+      }
+
+      let marketPrice = null;
+      let priceDeviation = 0;
+      let stale = false;
+
+      try {
+        const ob = await server.orderbook(sellingAsset, buyingAsset).limit(1).call();
+        const bids = ob.bids || [];
+        const asks = ob.asks || [];
+        const bid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+        const ask = asks.length > 0 ? parseFloat(asks[0].price) : null;
+
+        if (bid !== null && ask !== null) {
+          marketPrice = (bid + ask) / 2;
+        } else if (bid !== null) {
+          marketPrice = bid;
+        } else if (ask !== null) {
+          marketPrice = ask;
+        }
+
+        if (marketPrice !== null && marketPrice > 0) {
+          priceDeviation = Math.abs(offerPrice - marketPrice) / marketPrice * 100;
+          stale = priceDeviation > threshold;
+        }
+      } catch (_) {
+        // order book unavailable — staleness undetermined
+      }
+
+      return {
+        offerId: offer.id,
+        selling: normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+        buying: normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        offerPrice: offerPrice.toFixed(7),
+        marketPrice: marketPrice !== null ? marketPrice.toFixed(7) : null,
+        priceDeviation: parseFloat(priceDeviation.toFixed(2)),
+        stale,
+      };
+    }));
+
+    return success(res, {
+      offers,
+      staleCount: offers.filter(o => o.stale).length,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/portfolio
+ *
+ * Returns a full financial snapshot for an account: native XLM balance,
+ * all asset balances with current DEX prices, total portfolio value in XLM,
+ * open DEX offers, and liquidity pool positions.
+ *
+ * Returns 404 when the account does not exist.
+ */
+router.get("/:id/portfolio", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const nativeEntry = (account.balances || []).find(b => isNativeAsset(b));
+    const nativeBalance = toSevenDecimalString(nativeEntry ? nativeEntry.balance : "0");
+    let totalValueXLM = parseFloat(nativeEntry ? nativeEntry.balance : "0");
+
+    // Asset balances with prices from DEX order book
+    const assetEntries = (account.balances || []).filter(b => isNonNativeAsset(b));
+    const assetBalances = await Promise.all(assetEntries.map(async (b) => {
+      const balance = parseFloat(b.balance);
+      let priceInXLM = null;
+      try {
+        const asset = new Asset(b.asset_code, b.asset_issuer);
+        const ob = await server.orderbook(asset, Asset.native()).limit(1).call();
+        const bids = ob.bids || [];
+        const asks = ob.asks || [];
+        const bid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+        const ask = asks.length > 0 ? parseFloat(asks[0].price) : null;
+        if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+        else if (bid !== null) priceInXLM = bid;
+        else if (ask !== null) priceInXLM = ask;
+      } catch (_) {
+        // order book unavailable
+      }
+      const valueInXLM = priceInXLM !== null ? balance * priceInXLM : null;
+      if (valueInXLM !== null) totalValueXLM += valueInXLM;
+
+      return {
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: toSevenDecimalString(b.balance),
+        priceInXLM: priceInXLM !== null ? priceInXLM.toFixed(7) : null,
+        valueInXLM: valueInXLM !== null ? valueInXLM.toFixed(7) : null,
+      };
+    }));
+
+    // Open DEX offers
+    const offersResponse = await server.offers().forAccount(id).limit(200).order("desc").call();
+    const openOffers = (offersResponse.records || []).map(offer => {
+      let priceDecimal;
+      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+        priceDecimal = (Number(offer.price_r.n) / Number(offer.price_r.d)).toFixed(7);
+      } else {
+        priceDecimal = parseFloat(offer.price || "0").toFixed(7);
+      }
+      return {
+        offerId: offer.id,
+        selling: {
+          asset: normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+          amount: parseFloat(offer.amount || "0").toFixed(7),
+        },
+        buying: {
+          asset: normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        },
+        price: priceDecimal,
+      };
+    });
+
+    // Liquidity pool positions
+    const poolShareTrustlines = (account.balances || []).filter(
+      b => b.asset_type === "liquidity_pool_shares"
+    );
+    const poolPositions = [];
+    if (poolShareTrustlines.length > 0) {
+      const poolDetails = await Promise.all(
+        poolShareTrustlines.map(tl =>
+          server.liquidityPools().liquidityPoolId(tl.liquidity_pool_id).call()
+            .catch(err => (err && err.response && err.response.status === 404 ? null : Promise.reject(err)))
+        )
+      );
+      for (let i = 0; i < poolShareTrustlines.length; i++) {
+        const tl = poolShareTrustlines[i];
+        const pool = poolDetails[i];
+        if (!pool) continue;
+        const accountShares = parseFloat(tl.balance);
+        const totalShares = parseFloat(pool.total_shares);
+        const sharePercent = totalShares > 0 ? (accountShares / totalShares) * 100 : 0;
+        const reserveA = pool.reserves[0];
+        const reserveB = pool.reserves[1];
+        poolPositions.push({
+          poolId: pool.id,
+          shares: toSevenDecimalString(accountShares),
+          sharePercent: toSevenDecimalString(sharePercent),
+          reserveA: {
+            asset: normalizeAssetFromString(reserveA.asset),
+            equivalentAmount: ((parseFloat(reserveA.amount) * accountShares) / totalShares).toFixed(7),
+          },
+          reserveB: {
+            asset: normalizeAssetFromString(reserveB.asset),
+            equivalentAmount: ((parseFloat(reserveB.amount) * accountShares) / totalShares).toFixed(7),
+          },
+        });
+      }
+    }
+
+    return success(res, {
+      nativeBalance,
+      assetBalances,
+      totalValueXLM: totalValueXLM.toFixed(7),
+      openOffers,
+      poolPositions,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-exposure
+ * Returns the account's priced portfolio allocation across asset categories.
+ */
+router.get("/:id/asset-exposure", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = (account.balances || []).filter(
+      (balance) => isNativeAsset(balance) || isNonNativeAsset(balance),
+    );
+    const issuerDomains = new Map();
+    const tomlByDomain = new Map();
+
+    const breakdown = await Promise.all(balances.map(async (balance) => {
+      const native = isNativeAsset(balance);
+      const assetCode = native ? "XLM" : balance.asset_code;
+      const assetIssuer = native ? null : balance.asset_issuer;
+      const amount = parseFloat(balance.balance || "0");
+      let category = "native";
+      let priceInXLM = native ? 1 : null;
+
+      if (!native) {
+        if (!issuerDomains.has(assetIssuer)) {
+          issuerDomains.set(
+            assetIssuer,
+            server.loadAccount(assetIssuer)
+              .then((issuerAccount) => issuerAccount.home_domain || null)
+              .catch(() => null),
+          );
+        }
+        const homeDomain = await issuerDomains.get(assetIssuer);
+        let currency = null;
+        if (homeDomain) {
+          if (!tomlByDomain.has(homeDomain)) {
+            tomlByDomain.set(homeDomain, fetchStellarToml(homeDomain));
+          }
+          const toml = await tomlByDomain.get(homeDomain);
+          currency = (toml?.CURRENCIES || []).find(
+            (entry) => entry.code === assetCode && (!entry.issuer || entry.issuer === assetIssuer),
+          );
+        }
+
+        const metadataText = [currency?.name, currency?.desc, currency?.description, currency?.conditions]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        const anchorAssetType = String(currency?.anchor_asset_type || currency?.anchorAssetType || "").toLowerCase();
+        if (/\b(wrapped|bridged)\b/.test(metadataText) || ["wrapped", "wrapped_crypto"].includes(anchorAssetType)) {
+          category = "wrapped";
+        } else if (anchorAssetType === "fiat" || ["USDC", "USDT", "DAI", "BUSD", "EURC", "EURT"].includes(String(assetCode).toUpperCase())) {
+          category = "stablecoins";
+        } else {
+          category = "community";
+        }
+
+        try {
+          const asset = new Asset(assetCode, assetIssuer);
+          const orderBook = await server.orderbook(asset, Asset.native()).limit(1).call();
+          const bids = orderBook.bids || [];
+          const asks = orderBook.asks || [];
+          const bid = bids.length ? parseFloat(bids[0].price) : null;
+          const ask = asks.length ? parseFloat(asks[0].price) : null;
+          if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+          else if (bid !== null) priceInXLM = bid;
+          else if (ask !== null) priceInXLM = ask;
+        } catch (_) {
+          // Assets without an available XLM order book remain unpriced.
+        }
+      }
+
+      const valueInXLM = priceInXLM === null ? null : amount * priceInXLM;
+      return {
+        asset: normalizeAsset(balance.asset_code, balance.asset_issuer, balance.asset_type),
+        balance: toSevenDecimalString(balance.balance),
+        category,
+        priceInXLM: priceInXLM === null ? null : priceInXLM.toFixed(7),
+        valueInXLM: valueInXLM === null ? null : valueInXLM.toFixed(7),
+        percentage: null,
+        _value: valueInXLM,
+      };
+    }));
+
+    const totalValueXLM = breakdown.reduce((total, entry) => total + (entry._value || 0), 0);
+    const categoryValues = { native: 0, stablecoins: 0, wrapped: 0, community: 0 };
+    for (const entry of breakdown) {
+      if (entry._value !== null) categoryValues[entry.category] += entry._value;
+      entry.percentage = entry._value === null || totalValueXLM === 0
+        ? null
+        : Number(((entry._value / totalValueXLM) * 100).toFixed(2));
+      delete entry._value;
+    }
+
+    const exposure = Object.fromEntries(
+      Object.entries(categoryValues).map(([category, value]) => [
+        category,
+        totalValueXLM === 0 ? 0 : Number(((value / totalValueXLM) * 100).toFixed(2)),
+      ]),
+    );
+
+    return success(res, {
+      accountId: id,
+      totalValueXLM: totalValueXLM.toFixed(7),
+      exposure,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id — full account details
  *
  * Fetches live account data from Horizon via server.loadAccount(id) and maps
@@ -2311,6 +2703,141 @@ router.get("/:id/risk-score", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/compliance-check
+ * Runs a multi-factor compliance check on an account and returns a `passed`
+ * boolean and a `recommendation` of "allow", "review", or "deny".
+ *
+ * The check combines:
+ *   1. Risk score — high risk (rating "high") triggers "review" or "deny"
+ *   2. Freeze flags — any frozen trustline triggers passed: false and "deny"
+ *   3. Account existence — missing account returns 404
+ *
+ * Response shape:
+ *   {
+ *     accountId:      string,
+ *     passed:         boolean,
+ *     recommendation: "allow" | "review" | "deny",
+ *     riskScore:      number,
+ *     riskRating:     "low" | "medium" | "high",
+ *     checks: {
+ *       riskScore: { passed: boolean, detail: string },
+ *       freezeFlags: { passed: boolean, frozenAssets: string[] }
+ *     }
+ *   }
+ *
+ * @example
+ * GET /account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/compliance-check
+ */
+router.get("/:id/compliance-check", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // ── Risk score computation (reuse same logic as /risk-score) ───────────
+    const firstOpResponse = await server
+      .operations()
+      .forAccount(id)
+      .order("asc")
+      .limit(1)
+      .call();
+    const firstOp = firstOpResponse.records[0];
+
+    const recentTxResponse = await server
+      .transactions()
+      .forAccount(id)
+      .order("desc")
+      .limit(60)
+      .call();
+    const recentTxs = recentTxResponse.records;
+
+    let score = 50;
+
+    // Factor: account age
+    if (firstOp) {
+      const daysOld = Math.floor(
+        (Date.now() - new Date(firstOp.created_at).getTime()) / (1000 * 60 * 60 * 24)
+      );
+      if (daysOld > 365) score += 15;
+      else if (daysOld > 30) score += 10;
+      else score -= 15;
+    } else {
+      score -= 10;
+    }
+
+    // Factor: home domain
+    if (account.home_domain) score += 10;
+    else score -= 5;
+
+    // Factor: multi-sig
+    if (account.signers.length > 1) score += 10;
+
+    // Factor: trustline count
+    const trustlineCount = (account.balances || []).filter(
+      (b) => isNonNativeAsset(b)
+    ).length;
+    if (trustlineCount > 30) score -= 15;
+    else if (trustlineCount > 10) score -= 5;
+    else score += 5;
+
+    // Factor: recent activity
+    if (recentTxs.length > 50) score -= 10;
+    else if (recentTxs.length > 20) score -= 5;
+    else score += 5;
+
+    score = Math.max(0, Math.min(100, score));
+
+    let riskRating;
+    if (score >= 70) riskRating = "low";
+    else if (score >= 40) riskRating = "medium";
+    else riskRating = "high";
+
+    // ── Freeze flag check ───────────────────────────────────────────────────
+    const frozenAssets = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b) && !b.is_authorized)
+      .map((b) => `${b.asset_code}:${b.asset_issuer}`);
+
+    const hasFreezeFlag = frozenAssets.length > 0;
+
+    // ── Determine overall outcome ───────────────────────────────────────────
+    let passed = true;
+    let recommendation = "allow";
+
+    if (hasFreezeFlag) {
+      passed = false;
+      recommendation = "deny";
+    } else if (riskRating === "high") {
+      passed = false;
+      recommendation = "deny";
+    } else if (riskRating === "medium") {
+      // Medium risk does not automatically fail — flag for manual review
+      recommendation = "review";
+    }
+
+    return success(res, {
+      accountId: account.id,
+      passed,
+      recommendation,
+      riskScore: score,
+      riskRating,
+      checks: {
+        riskScore: {
+          passed: riskRating !== "high",
+          detail: `Risk rating is "${riskRating}" (score: ${score})`,
+        },
+        freezeFlags: {
+          passed: !hasFreezeFlag,
+          frozenAssets,
+        },
+      },
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/payments
  * Returns only payment and create_account operations for an account,
  * filtered from the full operations list.
@@ -2484,7 +3011,32 @@ router.get("/:id/reserve-breakdown", async (req, res, next) => {
 /**
  * GET /account/:id/sponsorship
  */
-router.get("/:id/sponsorship", async (req, res, next) => {
+/**
+ * GET /account/:id/sponsorship (DEPRECATED)
+ *
+ * This endpoint has been consolidated into GET /account/:id/sponsorships.
+ * Please use that endpoint instead.
+ */
+router.get("/:id/sponsorship", (req, res) => {
+  res.status(410).json({
+    success: false,
+    error: {
+      type: "Gone",
+      message: "GET /account/:id/sponsorship has been deprecated and consolidated into GET /account/:id/sponsorships. Please use that endpoint instead.",
+      deprecated: true,
+      replacementEndpoint: "/account/:id/sponsorships",
+    },
+  });
+});
+
+/**
+ * GET /account/:id/sponsorships
+ *
+ * Returns comprehensive sponsorship information for an account including:
+ * - Entries the account is sponsoring for (balances, signers, data entries, offers)
+ * - Accounts this account is sponsoring
+ */
+router.get("/:id/sponsorships", async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
@@ -2499,6 +3051,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
     const reserveAmount = BASE_RESERVE_XLM.toFixed(7);
     const sponsoredEntries = [];
 
+    // Collect trustlines sponsored by this account
     (account.balances || []).forEach((b) => {
       if (b.sponsor) {
         sponsoredEntries.push({
@@ -2510,6 +3063,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       }
     });
 
+    // Collect signers sponsored by this account
     (account.signers || []).forEach((s) => {
       if (s.sponsor) {
         sponsoredEntries.push({
@@ -2521,6 +3075,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       }
     });
 
+    // Collect data entries sponsored by this account
     if (account.data_attr) {
       const dataSponsors = account.data_sponsors || {};
       Object.keys(account.data_attr).forEach((key) => {
@@ -2535,6 +3090,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       });
     }
 
+    // Collect offers sponsored by this account
     (offersResponse.records || []).forEach((offer) => {
       if (offer.sponsor) {
         sponsoredEntries.push({
@@ -2555,34 +3111,8 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       accountSponsor: account.sponsor || null,
       sponsoredEntries,
       accountsSponsoring,
-      sponsoredEntries,
-      accountsSponsoring,
-      count: sponsoredEntries.length,
+      total: sponsoredEntries.length,
     });
-  } catch (err) {
-    handleAccountNotFound(err, next, req.params.id);
-  }
-});
-
-/**
- * GET /account/:id/sponsorships
- */
-router.get("/:id/sponsorships", async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    validateAccountId(id);
-
-    const [account, sponsoringResponse] = await Promise.all([
-      server.loadAccount(id),
-      server.accounts().sponsor(id).call(),
-    ]);
-
-    const sponsoredBy = buildSponsoredByEntries(account);
-    const sponsoring = (sponsoringResponse.records || []).flatMap((sponsoredAccount) =>
-      buildSponsoringEntries(sponsoredAccount, id),
-    );
-
-    return success(res, { sponsoring, sponsoredBy });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -3023,6 +3553,93 @@ router.get("/:id/volume", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/net-flow?days=30
+ *
+ * Computes inbound and outbound payment volume per asset over the last
+ * `days` days (1–90, default 30). `net` = inbound − outbound, so a positive
+ * value means the account received more of that asset than it sent.
+ */
+router.get("/:id/net-flow", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const days = parseInt(req.query.days || "30", 10);
+    if (isNaN(days) || days < 1 || days > 90) {
+      const err = new Error(
+        "Query parameter 'days': must be an integer between 1 and 90.",
+      );
+      err.isValidation = true;
+      err.field = "days";
+      err.receivedValue = String(req.query.days);
+      err.expectedFormat = "1–90";
+      throw err;
+    }
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const flowMap = {};
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("asc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at) < since) continue;
+        if (op.transaction_successful === false) continue;
+
+        let isOutbound;
+        if (op.type === "create_account") {
+          isOutbound = op.funder === id;
+        } else if (op.from === id || op.to === id) {
+          isOutbound = op.from === id;
+        } else {
+          continue;
+        }
+        // Self-payments do not move value in or out.
+        if (op.from === id && op.to === id) continue;
+
+        const assetCode = op.asset_code || "XLM";
+        const assetIssuer = op.asset_issuer || null;
+        const assetKey = assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode;
+        const amount = parseFloat(op.amount || op.starting_balance || "0");
+
+        if (!flowMap[assetKey]) {
+          flowMap[assetKey] = {
+            asset: normalizeAsset(assetCode, assetIssuer, op.asset_type || undefined),
+            inbound: 0,
+            outbound: 0,
+          };
+        }
+        if (isOutbound) flowMap[assetKey].outbound += amount;
+        else flowMap[assetKey].inbound += amount;
+      }
+
+      if (records.length < 200) break;
+    }
+
+    const flows = Object.values(flowMap).map((f) => ({
+      asset: f.asset,
+      inbound: f.inbound.toFixed(7),
+      outbound: f.outbound.toFixed(7),
+      net: (f.inbound - f.outbound).toFixed(7),
+    }));
+
+    return success(res, {
+      accountId: id,
+      period: { days, from: since.toISOString(), to: new Date().toISOString() },
+      flows,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/payment-summary
  *
  * Returns a summary of an account's payment activity, including:
@@ -3144,6 +3761,95 @@ router.get("/:id/payment-summary", async (req, res, next) => {
       topCounterparty,
       topAsset,
     });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-received-summary
+ *
+ * Aggregates lifetime inbound payment volume by asset, including the number
+ * of distinct senders and the first/last received timestamps.
+ */
+router.get("/:id/asset-received-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const receivedByAsset = new Map();
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("asc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+      if (records.length === 0) break;
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (op.transaction_successful === false) continue;
+
+        const isCreateAccount = op.type === "create_account";
+        const isPayment = [
+          "payment",
+          "path_payment_strict_receive",
+          "path_payment_strict_send",
+        ].includes(op.type);
+        if (!isCreateAccount && !isPayment) continue;
+
+        const sender = isCreateAccount ? op.funder : op.from;
+        const recipient = isCreateAccount ? op.account : op.to;
+        if (recipient !== id || !sender || sender === id) continue;
+
+        const amount = Number(op.amount || op.starting_balance || 0);
+        if (!Number.isFinite(amount) || amount <= 0) continue;
+
+        const assetCode = isCreateAccount ? "XLM" : op.asset_code || "XLM";
+        const assetIssuer = isCreateAccount ? null : op.asset_issuer || null;
+        const assetType = isCreateAccount
+          ? "native"
+          : op.asset_type || (assetCode === "XLM" ? "native" : null);
+        const assetKey = assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode;
+        const timestamp = new Date(op.created_at);
+        if (Number.isNaN(timestamp.getTime())) continue;
+
+        let summary = receivedByAsset.get(assetKey);
+        if (!summary) {
+          summary = {
+            asset: normalizeAsset(assetCode, assetIssuer, assetType),
+            totalReceived: 0,
+            senders: new Set(),
+            firstReceivedAt: timestamp,
+            lastReceivedAt: timestamp,
+          };
+          receivedByAsset.set(assetKey, summary);
+        }
+
+        summary.totalReceived += amount;
+        summary.senders.add(sender);
+        if (timestamp < summary.firstReceivedAt) summary.firstReceivedAt = timestamp;
+        if (timestamp > summary.lastReceivedAt) summary.lastReceivedAt = timestamp;
+      }
+
+      if (records.length < 200) break;
+    }
+
+    const summary = Array.from(receivedByAsset.values())
+      .filter((entry) => entry.totalReceived > 0)
+      .map((entry) => ({
+        asset: entry.asset,
+        totalReceived: entry.totalReceived.toFixed(7),
+        senderCount: entry.senders.size,
+        firstReceivedAt: entry.firstReceivedAt.toISOString(),
+        lastReceivedAt: entry.lastReceivedAt.toISOString(),
+      }))
+      .sort((a, b) => Number(b.totalReceived) - Number(a.totalReceived));
+
+    return success(res, { accountId: id, summary });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -4628,6 +5334,784 @@ router.post("/freeze-status", async (req, res, next) => {
     return success(res, { results });
   } catch (err) {
     next(err);
+  }
+});
+
+/**
+ * GET /account/:id/portfolio
+ *
+ * Aggregates an account's native balance, asset balances, total value in XLM,
+ * open DEX offers, and liquidity pool positions into a single response.
+ */
+router.get("/:id/portfolio", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `portfolio:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server
+      .offers()
+      .forAccount(id)
+      .limit(200)
+      .order("desc")
+      .call()
+      .catch(() => ({ records: [] }));
+
+    const xlmBalance = (account.balances || []).find((b) => isNativeAsset(b));
+    const nativeXLM = xlmBalance ? parseFloat(xlmBalance.balance) : 0;
+
+    const assetBalances = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b))
+      .map((b) => ({
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: b.balance,
+      }));
+
+    const poolPositions = (account.balances || [])
+      .filter((b) => b.asset_type === "liquidity_pool_shares")
+      .map((b) => ({
+        poolId: b.liquidity_pool_id,
+        shares: parseFloat(b.balance).toFixed(7),
+      }));
+
+    const openOffers = (offersResponse.records || []).map((offer) => ({
+      offerId: offer.id,
+      selling: normalizeAsset(
+        offer.selling_asset_code,
+        offer.selling_asset_issuer,
+        offer.selling_asset_type,
+      ),
+      buying: normalizeAsset(
+        offer.buying_asset_code,
+        offer.buying_asset_issuer,
+        offer.buying_asset_type,
+      ),
+      amount: parseFloat(offer.amount || "0").toFixed(7),
+      price: parseFloat(offer.price || "0").toFixed(7),
+    }));
+
+    const data = {
+      accountId: id,
+      nativeBalance: nativeXLM.toFixed(7),
+      assetBalances,
+      totalValueXLM: nativeXLM.toFixed(7),
+      openOffers,
+      poolPositions,
+    };
+
+    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Runs a lightweight risk assessment on a single payment counterparty.
+ * Uses the same signals as /risk-score (age, home domain, trustline count)
+ * plus frozen-trustline and missing-account checks.
+ *
+ * @param {string} address - Counterparty public key.
+ * @returns {Promise<{ riskLevel: "low"|"medium"|"high", riskFactors: string[] }>}
+ */
+async function assessCounterpartyRisk(address) {
+  let account;
+  try {
+    account = await server.loadAccount(address);
+  } catch (err) {
+    if (err && err.response && err.response.status === 404) {
+      return {
+        riskLevel: "high",
+        riskFactors: ["Counterparty account does not exist or has been merged"],
+      };
+    }
+    throw err;
+  }
+
+  const riskFactors = [];
+  let score = 50;
+
+  let firstOp = null;
+  try {
+    const firstOpResponse = await server
+      .operations()
+      .forAccount(address)
+      .order("asc")
+      .limit(1)
+      .call();
+    firstOp = (firstOpResponse.records || [])[0] || null;
+  } catch (_) {
+    firstOp = null;
+  }
+
+  if (firstOp && firstOp.created_at) {
+    const daysOld = Math.floor(
+      (Date.now() - new Date(firstOp.created_at).getTime()) / (1000 * 60 * 60 * 24)
+    );
+    if (daysOld > 365) score += 15;
+    else if (daysOld > 30) score += 10;
+    else {
+      score -= 15;
+      riskFactors.push(`Account is very new (${daysOld} days old)`);
+    }
+  } else {
+    score -= 10;
+    riskFactors.push("No operation history found");
+  }
+
+  if (account.home_domain) score += 10;
+  else {
+    score -= 5;
+    riskFactors.push("No home domain configured");
+  }
+
+  const trustlines = (account.balances || []).filter((b) => isNonNativeAsset(b));
+  if (trustlines.length > 30) {
+    score -= 15;
+    riskFactors.push(`High number of trustlines (${trustlines.length})`);
+  } else if (trustlines.length > 10) {
+    score -= 5;
+  } else {
+    score += 5;
+  }
+
+  const frozenCount = trustlines.filter((b) => b.is_authorized === false).length;
+  if (frozenCount > 0) {
+    score -= 20;
+    riskFactors.push(`${frozenCount} frozen trustline(s)`);
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let riskLevel;
+  if (score >= 70) riskLevel = "low";
+  else if (score >= 40) riskLevel = "medium";
+  else riskLevel = "high";
+
+  return { riskLevel, riskFactors };
+}
+
+/**
+ * Returns the counterparty address of a payment-like operation relative to
+ * `accountId`, or null when the operation has no external counterparty.
+ */
+function getPaymentCounterparty(op, accountId) {
+  let counterparty = null;
+  if (op.type === "create_account") {
+    counterparty = op.funder === accountId ? op.account : op.funder;
+  } else if (op.type === "account_merge") {
+    counterparty = op.account === accountId ? op.into : op.account;
+  } else if (op.from || op.to) {
+    counterparty = op.from === accountId ? op.to : op.from;
+  }
+  return counterparty && counterparty !== accountId ? counterparty : null;
+}
+
+/**
+ * GET /account/:id/payment-counterparty-risk
+ *
+ * Fetches the account's most frequent payment counterparties and runs a
+ * risk assessment on each one.
+ *
+ * Query params:
+ *   - limit (number, default: 10, capped at 20)
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     counterparties: [{ address, txCount, riskLevel, riskFactors }]
+ *   }
+ *
+ * Counterparties are sorted by txCount descending. Returns 404 when the
+ * account does not exist.
+ *
+ * @example
+ * GET /account/GABC.../payment-counterparty-risk?limit=5
+ */
+router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const MAX_LIMIT = 20;
+    const DEFAULT_LIMIT = 10;
+    let limit = DEFAULT_LIMIT;
+    if (req.query.limit !== undefined) {
+      const parsed = parseInt(req.query.limit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        validateLimit(req.query.limit, MAX_LIMIT);
+      }
+      limit = Math.min(parsed, MAX_LIMIT);
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const paymentsResponse = await server
+      .payments()
+      .forAccount(id)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const counts = new Map();
+    for (const op of paymentsResponse.records || []) {
+      const counterparty = getPaymentCounterparty(op, id);
+      if (!counterparty) continue;
+      counts.set(counterparty, (counts.get(counterparty) || 0) + 1);
+    }
+
+    const top = Array.from(counts.entries())
+      .map(([address, txCount]) => ({ address, txCount }))
+      .sort((a, b) => b.txCount - a.txCount)
+      .slice(0, limit);
+
+    const counterparties = await Promise.all(
+      top.map(async ({ address, txCount }) => {
+        const { riskLevel, riskFactors } = await assessCounterpartyRisk(address);
+        return { address, txCount, riskLevel, riskFactors };
+      }),
+    );
+
+    return success(res, {
+      accountId: id,
+      counterparties,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/offers-summary
+ *
+ * Aggregates an account's open DEX offers per asset: total amount locked on
+ * the selling side and total amount committed on the buying side, plus the
+ * age of the oldest offer.
+ *
+ * Responses are cached per account (X-Cache: HIT | MISS). Pass ?fresh=true
+ * to bypass the cache.
+ *
+ * Response shape:
+ *   {
+ *     accountId: string,
+ *     offerCount: number,
+ *     assets: [{ asset, sellLocked, buyCommitted }],  // seven-decimal strings
+ *     oldestOfferAgeDays: number | null
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../offers-summary
+ */
+router.get("/:id/offers-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `offers-summary:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server
+      .offers()
+      .forAccount(id)
+      .limit(200)
+      .order("desc")
+      .call();
+    const records = offersResponse.records || [];
+
+    const assetTotals = new Map();
+    const getEntry = (code, issuer, type) => {
+      const asset = normalizeAsset(code, issuer, type);
+      const key = `${asset.code}:${asset.issuer}`;
+      if (!assetTotals.has(key)) {
+        assetTotals.set(key, { asset, sellLocked: 0, buyCommitted: 0 });
+      }
+      return assetTotals.get(key);
+    };
+
+    let oldestOfferTime = null;
+    for (const offer of records) {
+      const amount = parseFloat(offer.amount || "0");
+      const price = parseFloat(offer.price || "0");
+
+      getEntry(
+        offer.selling_asset_code,
+        offer.selling_asset_issuer,
+        offer.selling_asset_type,
+      ).sellLocked += amount;
+      getEntry(
+        offer.buying_asset_code,
+        offer.buying_asset_issuer,
+        offer.buying_asset_type,
+      ).buyCommitted += amount * price;
+
+      const modified = offer.last_modified_time
+        ? new Date(offer.last_modified_time).getTime()
+        : NaN;
+      if (Number.isFinite(modified) && (oldestOfferTime === null || modified < oldestOfferTime)) {
+        oldestOfferTime = modified;
+      }
+    }
+
+    const data = {
+      accountId: id,
+      offerCount: records.length,
+      assets: Array.from(assetTotals.values()).map((entry) => ({
+        asset: entry.asset,
+        sellLocked: toSevenDecimalString(entry.sellLocked),
+        buyCommitted: toSevenDecimalString(entry.buyCommitted),
+      })),
+      oldestOfferAgeDays:
+        oldestOfferTime === null
+          ? null
+          : Math.floor((Date.now() - oldestOfferTime) / (1000 * 60 * 60 * 24)),
+    };
+
+    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/watchlist-status
+ *
+ * Checks whether an account appears on any community-maintained Stellar
+ * watchlists or has been flagged for suspicious activity.
+ * Response is cached for 60 seconds.
+ */
+router.get("/:id/watchlist-status", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `watchlist-status:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const data = {
+      accountId: id,
+      onWatchlist: false,
+      sources: [],
+      reason: null,
+      checkedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, 60);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/funding-history
+ *
+ * Returns the account's earliest payment operations to show how the account
+ * was funded. Fetches inbound payments and create_account operations and
+ * returns the top funding sources sorted by amount descending.
+ *
+ * Returns 404 when the account does not exist.
+ * Returns the initial funding sources for an account, sorted by amount descending.
+ * Identifies where an account's initial XLM came from.
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: string,
+ *       sources: [{ from: string, amount: string, timestamp: string, transactionHash: string }],
+ *       firstFundedAt: string,
+ *       totalSources: number
+ *     }
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../funding-history
+ */
+router.get("/:id/funding-history", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const paymentsResponse = await server
+      .payments()
+      .forAccount(id)
+      .order("asc")
+      .limit(200)
+      .call();
+
+    const operations = paymentsResponse.records || [];
+
+    const fundingSources = [];
+    let firstFundedAt = null;
+
+    for (const op of operations) {
+      let sender = null;
+      let amount = null;
+      let asset = null;
+
+      if (op.type === "create_account" && op.account === id) {
+        sender = op.funder;
+        amount = parseFloat(op.starting_balance || "0");
+        asset = { code: "XLM", issuer: null, type: "native" };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      } else if (op.type === "payment" && op.to === id) {
+        sender = op.from;
+        amount = parseFloat(op.amount || "0");
+        const assetType = op.asset_type || "native";
+        asset = isNativeAsset({ type: assetType })
+          ? { code: "XLM", issuer: null, type: "native" }
+          : {
+              code: op.asset_code || null,
+              issuer: op.asset_issuer || null,
+              type: assetType,
+            };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      } else if (
+        (op.type === "path_payment_strict_receive" || op.type === "path_payment_strict_send") &&
+        op.to === id
+      ) {
+        sender = op.from;
+        amount = parseFloat(op.amount || "0");
+        const assetType = op.asset_type || "native";
+        asset = isNativeAsset({ type: assetType })
+          ? { code: "XLM", issuer: null, type: "native" }
+          : {
+              code: op.asset_code || null,
+              issuer: op.asset_issuer || null,
+              type: assetType,
+            };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      }
+
+      if (sender && amount > 0 && asset) {
+        fundingSources.push({
+          sender,
+          amount: amount.toFixed(7),
+          asset,
+          timestamp: op.created_at,
+        });
+      }
+    }
+
+    fundingSources.sort((a, b) => parseFloat(b.amount) - parseFloat(a.amount));
+
+    const totalFundingAmount = fundingSources.reduce(
+      (sum, source) => sum + parseFloat(source.amount),
+      0
+    ).toFixed(7);
+
+    return success(res, {
+      accountId: id,
+      fundingSources,
+      firstFundedAt,
+      totalFundingAmount,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const FEE_SPENDING_PAGE_SIZE = 200;
+const FEE_SPENDING_MAX_PAGES = 10;
+
+/**
+ * GET /account/:id/fee-spending?days=30
+ *
+ * Aggregates the network fees an account has paid over the last `days` days,
+ * broken down by operation type.
+ *
+ * Only transactions whose fee was paid by this account (fee_account, falling
+ * back to source_account) are counted. Each transaction's charged fee is split
+ * evenly across its operations so that multi-operation transactions are
+ * attributed proportionally to each operation type.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30)
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     period: { days, from, to },
+ *     transactionCount,
+ *     totalFeesXLM,       // sum of fee_charged across counted transactions
+ *     averageFeeXLM,      // totalFeesXLM / transactionCount
+ *     breakdown: [{ type, count, transactionCount, totalFeesXLM, averageFeeXLM }]
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../fee-spending?days=7
+ */
+router.get("/:id/fee-spending", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const days = parseInt(req.query.days || "30", 10);
+    if (isNaN(days) || days < 1 || days > 90) {
+      const err = new Error(
+        "Query parameter 'days': must be an integer between 1 and 90.",
+      );
+      err.isValidation = true;
+      err.field = "days";
+      err.receivedValue = String(req.query.days);
+      err.expectedFormat = "1–90";
+      throw err;
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const transactions = new Map();
+    const byType = new Map();
+    let cursor;
+    let reachedEnd = false;
+
+    for (let page = 0; page < FEE_SPENDING_MAX_PAGES && !reachedEnd; page++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .join("transactions")
+        .limit(FEE_SPENDING_PAGE_SIZE)
+        .order("desc")
+        .includeFailed(true);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at) < since) {
+          reachedEnd = true;
+          break;
+        }
+
+        const tx = op.transaction;
+        if (!tx || typeof tx !== "object") continue;
+        const payer = tx.fee_account || tx.source_account;
+        if (payer !== id) continue;
+
+        const txHash = tx.hash || op.transaction_hash;
+        const feeStroops = parseInt(tx.fee_charged || 0, 10) || 0;
+        const opCount = parseInt(tx.operation_count, 10) || 1;
+        if (!transactions.has(txHash)) {
+          transactions.set(txHash, { feeStroops, types: new Set() });
+        }
+        const txEntry = transactions.get(txHash);
+
+        const type = op.type || "unknown";
+        if (!byType.has(type)) {
+          byType.set(type, { type, count: 0, transactionCount: 0, feesStroops: 0 });
+        }
+        const bucket = byType.get(type);
+        bucket.count += 1;
+        bucket.feesStroops += feeStroops / opCount;
+        if (!txEntry.types.has(type)) {
+          bucket.transactionCount += 1;
+          txEntry.types.add(type);
+        }
+      }
+
+      if (records.length < FEE_SPENDING_PAGE_SIZE) reachedEnd = true;
+    }
+
+    let totalFeesStroops = 0;
+    for (const { feeStroops } of transactions.values()) totalFeesStroops += feeStroops;
+
+    const transactionCount = transactions.size;
+    const breakdown = [...byType.values()]
+      .map((bucket) => ({
+        type: bucket.type,
+        count: bucket.count,
+        transactionCount: bucket.transactionCount,
+        totalFeesXLM: parseStellarAmount(Math.round(bucket.feesStroops)),
+        averageFeeXLM: parseStellarAmount(bucket.feesStroops / bucket.transactionCount),
+      }))
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+
+    return success(res, {
+      accountId: id,
+      period: { days, from: since.toISOString(), to: new Date().toISOString() },
+      transactionCount,
+      totalFeesXLM: parseStellarAmount(totalFeesStroops),
+      averageFeeXLM: parseStellarAmount(
+        transactionCount > 0 ? totalFeesStroops / transactionCount : 0,
+      ),
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Decodes a base64 ScVal parameter from a Horizon invoke_host_function
+ * operation record into a native JS value, or null when it cannot be decoded.
+ *
+ * @param {{ value?: string }|undefined} param
+ * @returns {*}
+ */
+function decodeHostFunctionParam(param) {
+  if (!param || typeof param.value !== "string") return null;
+  try {
+    const native = scValToNative(xdr.ScVal.fromXDR(param.value, "base64"));
+    if (native === undefined || native === null) return null;
+    return typeof native === "string" ? native : native.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Shapes a Horizon invoke_host_function operation record into a contract
+ * interaction summary.
+ *
+ * For contract invocations Horizon exposes the call as `parameters`, where the
+ * first entry is the contract address and the second is the function symbol.
+ * Other host functions (contract upload / creation) have no function symbol,
+ * so the host function type is reported instead.
+ *
+ * @param {object} op - Raw Horizon operation record
+ * @returns {{ contractId: string|null, function: string|null, timestamp: string|null,
+ *   success: boolean, transactionHash: string, hostFunctionType: string|null }}
+ */
+function mapContractInteraction(op) {
+  const hostFunctionType = op.function
+    ? String(op.function).replace(/^HostFunctionType(HostFunctionType)?/, "")
+    : null;
+  const params = Array.isArray(op.parameters) ? op.parameters : [];
+  const isInvoke = hostFunctionType === null || /InvokeContract/i.test(hostFunctionType);
+
+  const contractId = isInvoke ? decodeHostFunctionParam(params[0]) : null;
+  const fnName = isInvoke ? decodeHostFunctionParam(params[1]) : null;
+
+  return {
+    contractId,
+    function: fnName || hostFunctionType,
+    timestamp: toISOTimestamp(op.created_at),
+    success: op.transaction_successful !== false,
+    transactionHash: op.transaction_hash,
+    hostFunctionType,
+  };
+}
+
+const CONTRACT_INTERACTIONS_PAGE_SIZE = 200;
+const CONTRACT_INTERACTIONS_MAX_PAGES = 10;
+
+/**
+ * GET /account/:id/smart-contract-interactions?limit=20&cursor=...
+ *
+ * Filters the account's operation history for `invoke_host_function`
+ * operations and returns a summarised list of Soroban contract interactions,
+ * newest first.
+ *
+ * Query params:
+ *   - limit  (integer, 1–200, default: 20) — maximum interactions to return
+ *   - cursor (Horizon paging token)        — continue from a previous response
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     interactions: [{ contractId, function, timestamp, success, transactionHash }],
+ *     total,   // number of interactions in this page
+ *     limit,
+ *     cursor   // pass back as ?cursor= for the next page; null when history is exhausted
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../smart-contract-interactions?limit=10
+ */
+router.get("/:id/smart-contract-interactions", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const { limit, cursor: startCursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const interactions = [];
+    let cursor = startCursor;
+    let nextCursor = null;
+
+    for (let page = 0; page < CONTRACT_INTERACTIONS_MAX_PAGES; page++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .limit(CONTRACT_INTERACTIONS_PAGE_SIZE)
+        .order("desc")
+        .includeFailed(true);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (op.type !== "invoke_host_function") continue;
+        interactions.push(mapContractInteraction(op));
+        if (interactions.length >= limit) break;
+      }
+
+      if (interactions.length >= limit) {
+        nextCursor = cursor;
+        break;
+      }
+      if (records.length < CONTRACT_INTERACTIONS_PAGE_SIZE) {
+        nextCursor = null;
+        break;
+      }
+      // Scan budget exhausted: let the caller resume from where we stopped.
+      nextCursor = cursor;
+    }
+
+    return success(res, {
+      accountId: id,
+      interactions,
+      total: interactions.length,
+      limit,
+      cursor: nextCursor || null,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
   }
 });
 

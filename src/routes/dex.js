@@ -8,9 +8,11 @@ const { success } = require("../utils/response");
 const { validateAssetCode, validateAccountId, validateAsset, validateLimit } = require("../utils/validators");
 const { parseStellarAsset, normalizeAsset } = require("../utils/asset");
 const { isNativeAsset } = require("../utils/assetHelpers");
+const { formatAmount } = require("../utils/formatAmount");
 const cacheService = require("../services/cache");
 const cacheTTL = require("../config/cacheConfig");
 const { makeOrderBookEmptyError } = require("../utils/errors");
+const StellarKitError = require("../utils/StellarKitError");
 
 /**
  * @route GET /dex/arbitrage/:assetCode/:assetIssuer
@@ -268,18 +270,28 @@ router.get("/imbalance/:sellAsset/:buyAsset", async (req, res, next) => {
 
     const orderBook = await server.orderbook(selling, buying).limit(200).call();
 
-    const bidVolume = (orderBook.bids || []).reduce((sum, b) => sum + parseFloat(b.amount), 0);
-    const askVolume = (orderBook.asks || []).reduce((sum, a) => sum + parseFloat(a.amount), 0);
+    const amountScale = 10_000_000n;
+    const sumVolume = (levels) =>
+      (levels || []).reduce((total, level) => {
+        const [whole, fraction] = formatAmount(level.amount).split(".");
+        return total + BigInt(whole) * amountScale + BigInt(fraction);
+      }, 0n);
+    const bidVolume = sumVolume(orderBook.bids);
+    const askVolume = sumVolume(orderBook.asks);
 
-    if (bidVolume === 0 && askVolume === 0) {
+    if (bidVolume === 0n && askVolume === 0n) {
       return res.status(404).json({
         success: false,
         error: makeOrderBookEmptyError(selling.getCode(), buying.getCode()),
       });
     }
 
-    const imbalanceRatio = askVolume > 0 ? bidVolume / askVolume : (bidVolume > 0 ? 100 : 1);
-    
+    const imbalanceRatio = askVolume > 0n
+      ? Number(bidVolume) / Number(askVolume)
+      : (bidVolume > 0n ? 100 : 1);
+    const formatVolume = (volume) =>
+      `${volume / amountScale}.${(volume % amountScale).toString().padStart(7, "0")}`;
+
     let pressure = "neutral";
     let signal = "The market is currently balanced between buyers and sellers.";
 
@@ -292,8 +304,8 @@ router.get("/imbalance/:sellAsset/:buyAsset", async (req, res, next) => {
     }
 
     return success(res, {
-      bidVolume: bidVolume.toFixed(7),
-      askVolume: askVolume.toFixed(7),
+      bidVolume: formatVolume(bidVolume),
+      askVolume: formatVolume(askVolume),
       imbalanceRatio: imbalanceRatio.toFixed(4),
       pressure,
       signal,
@@ -728,6 +740,157 @@ router.get("/top-markets", async (req, res, next) => {
 });
 
 /**
+ * GET /dex/volume-leaders?limit=10
+ * Returns the top non-native assets ranked by 24-hour DEX trading volume
+ * against XLM.
+ *
+ * Query params:
+ *   - limit  (number, 1–50, default: 10)
+ *
+ * Response shape:
+ *   { success: true, data: { leaders: [...], updatedAt } }
+ *
+ * Each leader entry:
+ *   {
+ *     asset:              { code, issuer, type },
+ *     volume24h:          "1234567.0000000",  // XLM volume, seven decimals
+ *     tradeCount:         42,
+ *     priceChangePercent: "1.2345678" | null, // null when only one trade
+ *     uniqueTraders:      17
+ *   }
+ *
+ * Strategy:
+ *   Horizon has no "volume by asset" endpoint. We fetch the most recent 200
+ *   trades, keep only XLM-paired trades from the last 24 hours, aggregate per
+ *   asset client-side and rank by XLM volume descending. priceChangePercent is
+ *   derived from the oldest and newest XLM price observed in the window.
+ *
+ * Caching: 5 minute TTL (configurable via CACHE_TTL_VOLUME_LEADERS_MS).
+ *
+ * @example
+ * GET /dex/volume-leaders?limit=5
+ */
+router.get("/volume-leaders", async (req, res, next) => {
+  try {
+    const MAX_LIMIT = 50;
+    const DEFAULT_LIMIT = 10;
+    const rawLimit = req.query.limit;
+
+    let limit = DEFAULT_LIMIT;
+    if (rawLimit !== undefined) {
+      const parsed = parseInt(rawLimit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: "limit must be a positive integer between 1 and 50.",
+          },
+        });
+      }
+      limit = Math.min(parsed, MAX_LIMIT);
+    }
+
+    const cacheKey = `dex:volume-leaders:${limit}`;
+    const cached = cacheService.get(cacheKey);
+    if (cached) {
+      res.set("X-Cache", "HIT");
+      return success(res, cached);
+    }
+    res.set("X-Cache", "MISS");
+
+    const tradesResponse = await server
+      .trades()
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = tradesResponse.records || [];
+    const windowStart = Date.now() - 24 * 60 * 60 * 1000;
+    const assetMap = new Map();
+
+    for (const trade of trades) {
+      const closeTime = new Date(trade.ledger_close_time).getTime();
+      if (Number.isFinite(closeTime) && closeTime < windowStart) continue;
+
+      const baseNative = isNativeAsset({ type: trade.base_asset_type });
+      const counterNative = isNativeAsset({ type: trade.counter_asset_type });
+      // Only XLM-paired trades contribute to volume against XLM
+      if (baseNative === counterNative) continue;
+
+      const side = baseNative ? "counter" : "base";
+      const assetType = trade[`${side}_asset_type`];
+      const assetCode = trade[`${side}_asset_code`];
+      const assetIssuer = trade[`${side}_asset_issuer`];
+      const assetAmount = parseFloat(trade[`${side}_amount`] || "0");
+      const xlmAmount = parseFloat(
+        (baseNative ? trade.base_amount : trade.counter_amount) || "0",
+      );
+      const key = `${assetCode}:${assetIssuer}`;
+
+      if (!assetMap.has(key)) {
+        assetMap.set(key, {
+          asset: formatAsset(assetType, assetCode, assetIssuer),
+          volume: 0,
+          tradeCount: 0,
+          traders: new Set(),
+          newestPrice: null,
+          oldestPrice: null,
+        });
+      }
+
+      const entry = assetMap.get(key);
+      entry.volume += xlmAmount;
+      entry.tradeCount += 1;
+      if (trade.base_account) entry.traders.add(trade.base_account);
+      if (trade.counter_account) entry.traders.add(trade.counter_account);
+
+      // Price of the asset in XLM. Trades are ordered newest first.
+      if (assetAmount > 0) {
+        const price = xlmAmount / assetAmount;
+        if (entry.newestPrice === null) entry.newestPrice = price;
+        entry.oldestPrice = price;
+      }
+    }
+
+    const leaders = Array.from(assetMap.values())
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, limit)
+      .map((entry) => {
+        let priceChangePercent = null;
+        if (
+          entry.tradeCount > 1 &&
+          entry.oldestPrice !== null &&
+          entry.oldestPrice > 0
+        ) {
+          priceChangePercent = (
+            ((entry.newestPrice - entry.oldestPrice) / entry.oldestPrice) * 100
+          ).toFixed(7);
+        }
+
+        return {
+          asset: entry.asset,
+          volume24h: entry.volume.toFixed(7),
+          tradeCount: entry.tradeCount,
+          priceChangePercent,
+          uniqueTraders: entry.traders.size,
+        };
+      });
+
+    const data = {
+      leaders,
+      updatedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.volumeLeaders);
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * GET /dex/arbitrage-opportunities
  *
  * Scans the live Stellar DEX order books for common XLM trading pairs and
@@ -1004,6 +1167,432 @@ router.get("/price-history/:sellAsset/:buyAsset", async (req, res, next) => {
     cacheService.set(cacheKey, data, cacheTTL.arbitrage);
     res.set("X-Cache", "MISS");
     return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @route GET /dex/market-summary/:baseAsset/:counterAsset
+ * @desc Returns a 24-hour market summary for a trading pair including open, high, low,
+ *   close prices, base/counter volume, trade count, and 24-hour price change metrics.
+ * @param {string} req.params.baseAsset    - Base asset in `CODE:ISSUER` format or `XLM:native`.
+ * @param {string} req.params.counterAsset - Counter asset in `CODE:ISSUER` format or `XLM:native`.
+ * @returns {Promise<void>} JSON payload with pair, open, high, low, close, baseVolume,
+ *   counterVolume, tradeCount, priceChange24h, and priceChangePercent24h.
+ * @example
+ * curl -s "http://localhost:3000/dex/market-summary/XLM:native/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" | jq
+ * GET /dex/market-summary/:baseAsset/:counterAsset
+ *
+ * Computes 24-hour OHLCV data from trade history for an asset pair.
+ * open  = price of the oldest trade in the window
+ * close = price of the most recent trade
+ * high/low = extremes across all trades in the window
+ */
+router.get("/market-summary/:baseAsset/:counterAsset", async (req, res, next) => {
+  try {
+    const { baseAsset, counterAsset } = req.params;
+
+    let base, counter;
+    try {
+      base = parseDexAssetParam(baseAsset);
+      counter = parseDexAssetParam(counterAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    const cacheKey = `dex:market-summary:${baseAsset}:${counterAsset}`;
+    const MARKET_SUMMARY_CACHE_TTL = 60; // 60 seconds
+
+    if (req.query.fresh !== "true") {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+    res.set("X-Cache", "MISS");
+
+    const windowStartMs = Date.now() - 24 * 60 * 60 * 1000;
+
+    const tradesResponse = await server
+      .trades()
+      .forAssetPair(base, counter)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = (tradesResponse.records || []).filter(
+      (t) => new Date(t.ledger_close_time).getTime() >= windowStartMs,
+    );
+
+    if (trades.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(
+          base.isNative() ? "XLM" : base.getCode(),
+          counter.isNative() ? "XLM" : counter.getCode(),
+        ),
+      });
+    }
+
+    // trades are desc (newest first); close = index 0, open = last index
+    const prices = trades.map((t) => tradePrice(t));
+    const close = prices[0];
+    const open = prices[prices.length - 1];
+    const high = Math.max(...prices);
+    const low = Math.min(...prices);
+    const baseVolume = trades.reduce((sum, t) => sum + parseFloat(t.base_amount || "0"), 0);
+    const counterVolume = trades.reduce((sum, t) => sum + parseFloat(t.counter_amount || "0"), 0);
+    const priceChange24h = close - open;
+    const priceChangePercent24h = open > 0 ? (priceChange24h / open) * 100 : 0;
+
+    const data = {
+      pair: `${baseAsset}/${counterAsset}`,
+      open: open.toFixed(7),
+      high: high.toFixed(7),
+      low: low.toFixed(7),
+      close: close.toFixed(7),
+      baseVolume: baseVolume.toFixed(7),
+      counterVolume: counterVolume.toFixed(7),
+      priceChange24h: priceChange24h.toFixed(7),
+      priceChangePercent24h: priceChangePercent24h.toFixed(4),
+      tradeCount: trades.length,
+    };
+
+    cacheService.set(cacheKey, data, MARKET_SUMMARY_CACHE_TTL);
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /dex/asset-pairs
+ *
+ * Returns active trading pairs derived from the most recent trade history,
+ * ranked by 24h trade count.
+ *
+ * Query params:
+ *   limit     (number, 1–100, default: 20) — maximum pairs to return
+ *   baseAsset (string) — only return pairs with this base asset. Accepts
+ *             "XLM", "CODE" or "CODE:ISSUER".
+ */
+router.get("/asset-pairs", async (req, res, next) => {
+  try {
+    const limit = req.query.limit !== undefined ? validateLimit(req.query.limit, 100) : 20;
+
+    let baseFilter = null;
+    if (req.query.baseAsset !== undefined) {
+      const [code, issuer] = String(req.query.baseAsset).split(":");
+      const isXlm = code.toUpperCase() === "XLM" && (!issuer || issuer.toLowerCase() === "native");
+      if (!isXlm) {
+        validateAssetCode(code);
+        if (issuer) validateAccountId(issuer);
+      }
+      baseFilter = isXlm
+        ? { code: "XLM", issuer: null }
+        : { code: code.toUpperCase(), issuer: issuer || null };
+    }
+
+    const tradesResponse = await server.trades().order("desc").limit(200).call();
+    const windowStartMs = Date.now() - 24 * 60 * 60 * 1000;
+
+    const pairs = new Map();
+    for (const t of tradesResponse.records || []) {
+      if (new Date(t.ledger_close_time).getTime() < windowStartMs) continue;
+
+      const baseAsset = normalizeAsset(t.base_asset_code, t.base_asset_issuer, t.base_asset_type);
+      const counterAsset = normalizeAsset(t.counter_asset_code, t.counter_asset_issuer, t.counter_asset_type);
+
+      if (baseFilter) {
+        if (baseAsset.code.toUpperCase() !== baseFilter.code) continue;
+        if (baseFilter.issuer && baseAsset.issuer !== baseFilter.issuer) continue;
+      }
+
+      const key = `${baseAsset.code}:${baseAsset.issuer || "native"}/${counterAsset.code}:${counterAsset.issuer || "native"}`;
+      if (!pairs.has(key)) {
+        pairs.set(key, { baseAsset, counterAsset, tradeCount24h: 0, volume: 0 });
+      }
+      const entry = pairs.get(key);
+      entry.tradeCount24h += 1;
+      entry.volume += parseFloat(t.base_amount || "0");
+    }
+
+    const data = [...pairs.values()]
+      .sort((a, b) => b.tradeCount24h - a.tradeCount24h)
+      .slice(0, limit)
+      .map((p) => ({
+        baseAsset: p.baseAsset,
+        counterAsset: p.counterAsset,
+        tradeCount24h: p.tradeCount24h,
+        volume24h: p.volume.toFixed(7),
+      }));
+
+    return success(res, { pairs: data, total: data.length, limit });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /dex/liquidity-depth/:baseAsset/:counterAsset
+ *
+ * Returns cumulative bid and ask volume at configurable price intervals,
+ * helping developers estimate slippage before submitting a trade.
+ *
+ * Query params:
+ *   levels (number, 1–50, default: 10) — number of price levels to return
+ */
+router.get("/liquidity-depth/:baseAsset/:counterAsset", async (req, res, next) => {
+  try {
+    const { baseAsset, counterAsset } = req.params;
+
+    const MAX_LEVELS = 50;
+    const DEFAULT_LEVELS = 10;
+    let levels = DEFAULT_LEVELS;
+
+    if (req.query.levels !== undefined) {
+      const parsed = parseInt(req.query.levels, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: "ValidationError",
+            message: "levels must be a positive integer between 1 and 50.",
+          },
+        });
+      }
+      levels = Math.min(parsed, MAX_LEVELS);
+    }
+
+    let selling, buying;
+    try {
+      selling = parseDexAssetParam(baseAsset);
+      buying = parseDexAssetParam(counterAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    const orderBookResponse = await server
+      .orderbook(selling, buying)
+      .limit(200)
+      .call();
+
+    const rawBids = orderBookResponse.bids || [];
+    const rawAsks = orderBookResponse.asks || [];
+
+    if (rawBids.length === 0 && rawAsks.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(
+          selling.isNative() ? "XLM" : selling.getCode(),
+          buying.isNative() ? "XLM" : buying.getCode(),
+        ),
+      });
+    }
+
+    function buildDepthLevels(entries, count) {
+      let cumulative = 0;
+      return entries.slice(0, count).map((entry) => {
+        const vol = parseFloat(entry.amount);
+        cumulative += vol;
+        return {
+          price: parseFloat(entry.price).toFixed(7),
+          volume: vol.toFixed(7),
+          cumulativeVolume: cumulative.toFixed(7),
+        };
+      });
+    }
+
+    const bids = buildDepthLevels(rawBids, levels);
+    const asks = buildDepthLevels(rawAsks, levels);
+
+    const totalBidVolume = rawBids.reduce((sum, b) => sum + parseFloat(b.amount), 0);
+    const totalAskVolume = rawAsks.reduce((sum, a) => sum + parseFloat(a.amount), 0);
+
+    const bestBid = rawBids.length > 0 ? parseFloat(rawBids[0].price) : null;
+    const bestAsk = rawAsks.length > 0 ? parseFloat(rawAsks[0].price) : null;
+    const midPrice =
+      bestBid !== null && bestAsk !== null
+        ? ((bestBid + bestAsk) / 2).toFixed(7)
+        : (bestBid ?? bestAsk ?? 0).toFixed(7);
+
+    const data = {
+      pair: `${baseAsset}/${counterAsset}`,
+      bids,
+      asks,
+      totalBidVolume: totalBidVolume.toFixed(7),
+      totalAskVolume: totalAskVolume.toFixed(7),
+      midPrice,
+    };
+
+    return success(res, data);
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(req.params.baseAsset, req.params.counterAsset),
+      });
+    }
+    next(err);
+  }
+});
+
+/**
+ * Converts an SDK Asset instance into the standard { code, issuer, type } shape.
+ *
+ * @param {Asset} asset
+ * @returns {{ code: string, issuer: string|null, type: string }}
+ */
+function assetToObject(asset) {
+  if (asset.isNative()) return normalizeAsset("XLM", null, "native");
+  return normalizeAsset(asset.getCode(), asset.getIssuer(), asset.getAssetType());
+}
+
+function makeNoPathFoundError(sourceAsset, destAsset) {
+  return new StellarKitError(
+    `No conversion path exists from ${sourceAsset} to ${destAsset}.`,
+    404,
+    "NoPathFound",
+    "Horizon could not find any order book or liquidity pool route between these assets for the requested amount.",
+    "Try a smaller amount, or check that both assets have active markets on the Stellar DEX."
+  );
+}
+
+/**
+ * GET /dex/best-path/:sourceAsset/:destAsset?amount=1
+ * Finds the optimal conversion path between two assets using Horizon's
+ * strict-send path finding, and reports the estimated rate, total slippage
+ * and the ordered sequence of assets to route through.
+ *
+ * Assets are given in `CODE:ISSUER` format, or `XLM:native` for lumens.
+ *
+ * Query params:
+ *   - amount (positive number, default: 1) — amount of sourceAsset to convert.
+ *
+ * Slippage is estimated by comparing the best rate for the requested amount
+ * against the best rate for a small reference trade (1% of the amount), which
+ * approximates the marginal (spot) rate along the best available route.
+ *
+ * Response shape:
+ *   {
+ *     sourceAsset:     { code, issuer, type },
+ *     destAsset:       { code, issuer, type },
+ *     path:            [{ code, issuer, type }, ...], // source → intermediates → destination
+ *     estimatedRate:   "0.1275000",   // destAsset received per 1 sourceAsset
+ *     slippagePercent: "0.4200",
+ *     hops:            1,             // number of intermediate assets routed through
+ *     sourceAmount:    "100.0000000",
+ *     destinationAmount: "12.7500000"
+ *   }
+ *
+ * @throws 400 ValidationError for malformed assets or amount
+ * @throws 404 NoPathFound when no conversion path exists
+ *
+ * @example
+ * GET /dex/best-path/XLM:native/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN?amount=100
+ */
+router.get("/best-path/:sourceAsset/:destAsset", async (req, res, next) => {
+  try {
+    const { sourceAsset, destAsset } = req.params;
+
+    let source, dest;
+    try {
+      source = parseStellarAsset(sourceAsset);
+      dest = parseStellarAsset(destAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    if (source.equals(dest)) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "sourceAsset and destAsset must be different." },
+      });
+    }
+
+    const rawAmount = req.query.amount === undefined ? "1" : String(req.query.amount);
+    const parsedAmount = parseFloat(rawAmount);
+    if (!/^\d+(\.\d+)?$/.test(rawAmount) || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "amount must be a positive number." },
+      });
+    }
+
+    const formattedAmount = parsedAmount.toFixed(7);
+    const referenceAmount = Math.max(parsedAmount / 100, 0.0000001).toFixed(7);
+
+    const pickBest = (records) =>
+      records.reduce((a, b) =>
+        parseFloat(a.destination_amount) >= parseFloat(b.destination_amount) ? a : b
+      );
+
+    const fetchPaths = async (amount) => {
+      try {
+        const response = await server.strictSendPaths(source, amount, [dest]).call();
+        return response.records || [];
+      } catch (err) {
+        if (err.response && err.response.status === 404) return [];
+        throw err;
+      }
+    };
+
+    const [records, referenceRecords] = await Promise.all([
+      fetchPaths(formattedAmount),
+      fetchPaths(referenceAmount),
+    ]);
+
+    if (records.length === 0) {
+      throw makeNoPathFoundError(sourceAsset, destAsset);
+    }
+
+    const best = pickBest(records);
+    const sourceAmount = parseFloat(best.source_amount);
+    const destinationAmount = parseFloat(best.destination_amount);
+
+    if (!(sourceAmount > 0) || !(destinationAmount > 0)) {
+      throw makeNoPathFoundError(sourceAsset, destAsset);
+    }
+
+    const estimatedRate = destinationAmount / sourceAmount;
+
+    let slippagePercent = 0;
+    if (referenceRecords.length > 0) {
+      const reference = pickBest(referenceRecords);
+      const referenceRate =
+        parseFloat(reference.destination_amount) / parseFloat(reference.source_amount);
+      if (Number.isFinite(referenceRate) && referenceRate > estimatedRate) {
+        slippagePercent = ((referenceRate - estimatedRate) / referenceRate) * 100;
+      }
+    }
+
+    const intermediates = (best.path || []).map((hop) =>
+      normalizeAsset(hop.asset_code, hop.asset_issuer, hop.asset_type),
+    );
+    const sourceObject = assetToObject(source);
+    const destObject = assetToObject(dest);
+
+    return success(res, {
+      sourceAsset: sourceObject,
+      destAsset: destObject,
+      path: [sourceObject, ...intermediates, destObject],
+      estimatedRate: estimatedRate.toFixed(7),
+      slippagePercent: slippagePercent.toFixed(4),
+      hops: intermediates.length,
+      sourceAmount: sourceAmount.toFixed(7),
+      destinationAmount: destinationAmount.toFixed(7),
+    });
   } catch (err) {
     next(err);
   }

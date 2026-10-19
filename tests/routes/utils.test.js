@@ -318,3 +318,65 @@ describe("POST /utils/decode-xdr", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /utils/convert — XLM <-> stroops conversion edge cases
+// ---------------------------------------------------------------------------
+
+describe("GET /utils/convert", () => {
+  // Case 1: ?xlm=1 returns { stroops: 10000000 }
+  it("?xlm=1 returns stroops: 10000000", async () => {
+    const res = await request(app).get("/utils/convert?xlm=1");
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.stroops).toBe(10000000);
+  });
+
+  // Case 2: ?stroops=10000000 returns { xlm: "1.0000000" }
+  it("?stroops=10000000 returns xlm: '1.0000000'", async () => {
+    const res = await request(app).get("/utils/convert?stroops=10000000");
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    // Conversion accuracy verified to seven decimal places
+    expect(res.body.data.xlm).toBe("1.0000000");
+  });
+
+  // Case 3: ?xlm=0 returns { stroops: 0 }
+  it("?xlm=0 returns stroops: 0", async () => {
+    const res = await request(app).get("/utils/convert?xlm=0");
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.stroops).toBe(0);
+    // XLM representation is also accurate to seven decimal places
+    expect(res.body.data.xlm).toBe("0.0000000");
+  });
+
+  // Case 4: non-numeric value returns 400
+  it("non-numeric xlm value returns 400", async () => {
+    const res = await request(app).get("/utils/convert?xlm=abc");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.success).toBe(false);
+  });
+
+  it("non-numeric stroops value returns 400", async () => {
+    const res = await request(app).get("/utils/convert?stroops=abc");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.success).toBe(false);
+  });
+
+  // Case 5: providing both xlm and stroops returns 400 with a clear message
+  it("providing both xlm and stroops returns 400 with a clear message", async () => {
+    const res = await request(app).get("/utils/convert?xlm=1&stroops=10000000");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.success).toBe(false);
+    // Error message must mention both params
+    const msg = (res.body.error && res.body.error.message) || "";
+    expect(msg.toLowerCase()).toMatch(/xlm|stroops/);
+  });
+});

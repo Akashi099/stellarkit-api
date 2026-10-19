@@ -1,3 +1,25 @@
+// Registered route files (alphabetical order):
+//   account.counterparties  → /account/:id/counterparties
+//   account                 → /account/:id/*
+//   accounts                → /accounts/*
+//   asset                   → /asset/*
+//   cacheStats              → /cache/*
+//   claimableBalances       → /claimable-balances/*
+//   dex                     → /dex/*
+//   feeEstimate             → /fee-estimate/*
+//   liquidityPool           → /liquidity-pools/*
+//   metrics                 → /metrics
+//   network                 → /network/*
+//   networkStatus           → /network-status
+//   soroban                 → /soroban/*
+//   stellarToml             → /stellar-toml/*
+//   stream                  → /stream/*
+//   transaction.effects     → /transaction/:hash/effects
+//   transactions            → /transactions/*
+//   utils                   → /utils/*
+//   webhooks                → /webhooks/*
+//   assetsOverview          → /assets-overview
+
 require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
@@ -684,6 +706,24 @@ app.get("/", (req, res) => {
           path: "/dex/top-markets",
           description:
             "Top DEX trading pairs by volume with spread (optional ?limit=, default 10, max 50)",
+        },
+        {
+          method: "GET",
+          path: "/dex/volume-leaders",
+          description:
+            "Top assets by 24h DEX volume against XLM (optional ?limit=, default 10, max 50)",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/payment-counterparty-risk",
+          description:
+            "Risk assessment of an account's top payment counterparties (optional ?limit=, default 10, max 20)",
+        },
+        {
+          method: "GET",
+          path: "/account/:id/offers-summary",
+          description:
+            "Aggregated open offer totals per asset (cached; ?fresh=true bypasses cache)",
         },
         {
           method: "GET",
