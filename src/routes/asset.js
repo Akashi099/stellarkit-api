@@ -775,4 +775,166 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
   }
 });
 
+/**
+ * Resolution map for the holder-growth time series.
+ *
+ * Each resolution defines a look-back window (`windowMs`) and a bucket size
+ * (`bucketMs`). Trustline operations are grouped into buckets of `bucketMs`
+ * and ordered oldest-first; `holders` is the cumulative net change since the
+ * start of the window.
+ *
+ * - 7d  — 7-day window,   daily buckets   (fine-grained recent growth)
+ * - 30d — 30-day window, weekly buckets  (month-over-month growth, default)
+ * - 90d — 90-day window, weekly buckets  (quarterly growth trend)
+ */
+const HOLDER_GROWTH_RESOLUTIONS = {
+  "7d": { windowMs: 7 * 24 * 60 * 60 * 1000, bucketMs: 24 * 60 * 60 * 1000 },
+  "30d": { windowMs: 30 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+  "90d": { windowMs: 90 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+};
+
+/**
+ * Buckets change_trust operations into a holder-growth time series.
+ *
+ * A change_trust operation with `limit > 0` creates a trustline (+1 holder);
+ * a change_trust with `limit === 0` removes one (-1 holder). Operations that
+ * fall before `windowStartMs` are excluded. Buckets are returned oldest-first
+ * with a running `holders` total so each entry describes the net growth at
+ * that point in time.
+ *
+ * @param {Array<Object>} operations - change_trust records from Horizon.
+ * @param {number} windowStartMs - Unix-ms cutoff; earlier ops are ignored.
+ * @param {number} bucketMs - Width of each time bucket in milliseconds.
+ * @returns {Array<{date: string, holders: number, change: number, added: number, removed: number}>}
+ */
+function aggregateTrustlineGrowth(operations, windowStartMs, bucketMs) {
+  const buckets = new Map();
+
+  for (const op of operations) {
+    const opTime = new Date(op.created_at).getTime();
+    if (!Number.isFinite(opTime) || opTime < windowStartMs) {
+      continue;
+    }
+
+    const bucketStart = Math.floor(opTime / bucketMs) * bucketMs;
+    if (!buckets.has(bucketStart)) {
+      buckets.set(bucketStart, {
+        bucketStart,
+        date: new Date(bucketStart).toISOString(),
+        change: 0,
+        added: 0,
+        removed: 0,
+      });
+    }
+
+    const bucket = buckets.get(bucketStart);
+    if (parseFloat(op.limit) > 0) {
+      bucket.change += 1;
+      bucket.added += 1;
+    } else {
+      bucket.change -= 1;
+      bucket.removed += 1;
+    }
+  }
+
+  const sorted = Array.from(buckets.values()).sort(
+    (a, b) => a.bucketStart - b.bucketStart,
+  );
+
+  let cumulativeHolders = 0;
+  return sorted.map((bucket) => {
+    cumulativeHolders += bucket.change;
+    return {
+      date: bucket.date,
+      holders: cumulativeHolders,
+      change: bucket.change,
+      added: bucket.added,
+      removed: bucket.removed,
+    };
+  });
+}
+
+/**
+ * GET /asset/:code/:issuer/holder-growth
+ *
+ * Returns a holder-growth time series built from trustline (change_trust)
+ * operation history. Each entry covers one time bucket (sized by the
+ * resolution) and reports the net change in holders within that bucket plus
+ * the cumulative holder count since the start of the window.
+ *
+ * @param {string} code - Asset code, e.g. USDC
+ * @param {string} issuer - Asset issuer account ID (G...)
+ * @param {string} [resolution=30d] - Time resolution: 7d, 30d, or 90d.
+ * @param {string} [fresh] - Bypass cache when "true".
+ * @returns {Object} `{ growth: Array, asset: Object, resolution: string }`
+ * @example
+ * curl "http://localhost:3000/asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/holder-growth?resolution=30d"
+ */
+router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const resolution = req.query.resolution || "30d";
+
+    if (!HOLDER_GROWTH_RESOLUTIONS[resolution]) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: "Invalid resolution. Accepted values are 7d, 30d, and 90d.",
+          field: "resolution",
+          receivedValue: String(resolution),
+        },
+      });
+    }
+
+    const cacheKey = `asset-holder-growth:${assetCode}:${issuer}:${resolution}`;
+    const fresh = isFreshRequest(req.query);
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const { windowMs, bucketMs } = HOLDER_GROWTH_RESOLUTIONS[resolution];
+    const windowStartMs = Date.now() - windowMs;
+
+    // Fetch recent operations for the issuer and keep only change_trust ops
+    // that target this asset. `limit > 0` is a trustline creation, `limit === 0`
+    // is a trustline deletion (see the change_trust mapping in account.js).
+    const operationsResponse = await server
+      .operations()
+      .forAccount(issuer)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const records = (operationsResponse.records || []).filter(
+      (op) =>
+        op.type === "change_trust" &&
+        op.asset_code === assetCode &&
+        op.asset_issuer === issuer,
+    );
+
+    const growth = aggregateTrustlineGrowth(records, windowStartMs, bucketMs);
+
+    const data = {
+      growth,
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+      resolution,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.asset);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
