@@ -3461,6 +3461,287 @@ router.get(
   },
 );
 
+/** Largest amount a Stellar balance can hold: INT64_MAX stroops. */
+const MAX_BALANCE_STROOPS = 9223372036854775807n;
+const STROOPS_PER_UNIT = 10_000_000n;
+
+/**
+ * Converts a Horizon decimal amount string (up to seven decimals) to BigInt
+ * stroops so capacity arithmetic stays exact across the full int64 range.
+ *
+ * @param {string|undefined} amount
+ * @returns {bigint}
+ */
+function amountToStroops(amount) {
+  const match = String(amount ?? "0").trim().match(/^(-?)(\d+)(?:\.(\d{1,7}))?$/);
+  if (!match) return 0n;
+  const [, sign, whole, fraction = ""] = match;
+  const stroops = BigInt(whole) * STROOPS_PER_UNIT + BigInt(fraction.padEnd(7, "0"));
+  return sign === "-" ? -stroops : stroops;
+}
+
+/**
+ * Formats BigInt stroops as a seven-decimal amount string.
+ *
+ * @param {bigint} stroops
+ * @returns {string}
+ */
+function stroopsToAmount(stroops) {
+  const sign = stroops < 0n ? "-" : "";
+  const abs = stroops < 0n ? -stroops : stroops;
+  const fraction = (abs % STROOPS_PER_UNIT).toString().padStart(7, "0");
+  return `${sign}${abs / STROOPS_PER_UNIT}.${fraction}`;
+}
+
+/**
+ * Builds one receive-capacity entry. Incoming amounts are bounded by
+ * `limit - balance - buyingLiabilities`, because open buy offers reserve
+ * room under the limit just like a settled balance does.
+ */
+function buildCapacityEntry(asset, limitStroops, balanceStroops, buyingStroops) {
+  const used = balanceStroops + buyingStroops;
+  const remaining = limitStroops > used ? limitStroops - used : 0n;
+  // Two-decimal percentage computed in integer basis points to avoid float drift.
+  const basisPoints = limitStroops > 0n ? (remaining * 10000n) / limitStroops : 0n;
+  return {
+    asset,
+    limit: stroopsToAmount(limitStroops),
+    balance: stroopsToAmount(balanceStroops),
+    remaining: stroopsToAmount(remaining),
+    remainingPercent: `${basisPoints / 100n}.${(basisPoints % 100n).toString().padStart(2, "0")}`,
+  };
+}
+
+/**
+ * GET /account/:id/receive-capacity
+ *
+ * Reports how much more of each held asset the account can receive before
+ * hitting its trustline limit, so wallets can warn a sender up front.
+ *
+ * Native XLM has no trustline, so its limit is the protocol ceiling
+ * (INT64_MAX stroops). Its entry also carries `spendableBalance` — the
+ * balance above the minimum reserve and selling liabilities.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, capacity: [{ asset, limit, balance, remaining, remainingPercent }] } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/receive-capacity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = account.balances || [];
+
+    const capacity = [];
+
+    const native = balances.find((b) => isNativeAsset(b));
+    if (native) {
+      const BASE_RESERVE_STROOPS = 5_000_000n;
+      const subentries = BigInt(account.subentry_count || 0);
+      const sponsoring = BigInt(account.num_sponsoring || 0);
+      const sponsored = BigInt(account.num_sponsored || 0);
+      const minimumBalance =
+        (2n + subentries + sponsoring - sponsored) * BASE_RESERVE_STROOPS;
+
+      const balance = amountToStroops(native.balance);
+      const spendable = balance - minimumBalance - amountToStroops(native.selling_liabilities);
+
+      capacity.push({
+        ...buildCapacityEntry(
+          normalizeAsset("XLM", null, "native"),
+          MAX_BALANCE_STROOPS,
+          balance,
+          amountToStroops(native.buying_liabilities),
+        ),
+        spendableBalance: stroopsToAmount(spendable > 0n ? spendable : 0n),
+      });
+    }
+
+    for (const b of balances) {
+      // Pool shares cannot be received via payments, so they are excluded.
+      if (isNativeAsset(b) || b.asset_type === "liquidity_pool_shares") continue;
+      capacity.push(
+        buildCapacityEntry(
+          normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+          amountToStroops(b.limit),
+          amountToStroops(b.balance),
+          amountToStroops(b.buying_liabilities),
+        ),
+      );
+    }
+
+    return success(res, { accountId: id, capacity });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const VELOCITY_LOOKBACK_DAYS = 30;
+/** Minimum completed days of history needed before a baseline is trusted. */
+const VELOCITY_MIN_BASELINE_DAYS = 7;
+const VELOCITY_STDDEV_THRESHOLD = 2;
+const PATH_PAYMENT_TYPES = new Set([
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+
+/**
+ * Returns the signed change (in stroops) a payment-stream record applied to
+ * the account's native XLM balance, or 0n if it did not touch native XLM.
+ *
+ * @param {Object} op - Horizon payments-endpoint record.
+ * @param {string} accountId
+ * @returns {bigint}
+ */
+function nativeBalanceDelta(op, accountId) {
+  if (op.type === "create_account") {
+    if (op.account === accountId) return amountToStroops(op.starting_balance);
+    if (op.funder === accountId) return -amountToStroops(op.starting_balance);
+    return 0n;
+  }
+
+  if (op.type !== "payment" && !PATH_PAYMENT_TYPES.has(op.type)) return 0n;
+  if (op.from === accountId && op.to === accountId) return 0n;
+
+  let delta = 0n;
+  if (op.to === accountId && op.asset_type === "native") {
+    delta += amountToStroops(op.amount);
+  }
+  if (op.from === accountId) {
+    const sentNative = PATH_PAYMENT_TYPES.has(op.type)
+      ? op.source_asset_type === "native"
+      : op.asset_type === "native";
+    if (sentNative) {
+      delta -= amountToStroops(PATH_PAYMENT_TYPES.has(op.type) ? op.source_amount : op.amount);
+    }
+  }
+  return delta;
+}
+
+/**
+ * GET /account/:id/balance-velocity
+ *
+ * Measures how fast the account's native XLM balance is moving and flags
+ * unusual activity. Payments from the last 30 days are bucketed into
+ * 24-hour windows ending now. The most recent bucket's absolute net change
+ * is the current rate; the older buckets form the historical baseline.
+ *
+ * `velocityFlag` is true when the current rate exceeds the baseline mean by
+ * more than two standard deviations. Accounts with fewer than seven days of
+ * history have no trustworthy baseline and always report `false`.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, asset, windows: { change24h, change7d, change30d },
+ *          currentRate, baseline: { sampleDays, average, standardDeviation, threshold }, velocityFlag } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/balance-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - VELOCITY_LOOKBACK_DAYS * DAY_MS;
+    const dailyNet = new Array(VELOCITY_LOOKBACK_DAYS).fill(0n);
+    let earliestSeen = null;
+    let reachedOlderHistory = false;
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("desc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        const createdAt = new Date(op.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        if (createdAt < windowStart) {
+          reachedOlderHistory = true;
+          break;
+        }
+        if (earliestSeen === null || createdAt < earliestSeen) earliestSeen = createdAt;
+        if (op.transaction_successful === false) continue;
+
+        const dayIndex = Math.min(
+          VELOCITY_LOOKBACK_DAYS - 1,
+          Math.max(0, Math.floor((now - createdAt) / DAY_MS)),
+        );
+        dailyNet[dayIndex] += nativeBalanceDelta(op, id);
+      }
+
+      if (reachedOlderHistory || records.length < 200) break;
+    }
+
+    const sumDays = (days) => dailyNet.slice(0, days).reduce((acc, v) => acc + v, 0n);
+    const windows = {
+      change24h: stroopsToAmount(sumDays(1)),
+      change7d: stroopsToAmount(sumDays(7)),
+      change30d: stroopsToAmount(sumDays(VELOCITY_LOOKBACK_DAYS)),
+    };
+
+    // Completed days of history available before the current 24h bucket.
+    // If Horizon returned anything older than the lookback window, every
+    // bucket is real data (zero-activity days included).
+    let historyDays = 0;
+    if (reachedOlderHistory) {
+      historyDays = VELOCITY_LOOKBACK_DAYS - 1;
+    } else if (earliestSeen !== null) {
+      historyDays = Math.min(
+        VELOCITY_LOOKBACK_DAYS - 1,
+        Math.floor((now - earliestSeen) / DAY_MS),
+      );
+    }
+
+    const toUnits = (stroops) => Number(stroops < 0n ? -stroops : stroops) / Number(STROOPS_PER_UNIT);
+    const currentRate = toUnits(dailyNet[0]);
+
+    let baseline = {
+      sampleDays: historyDays,
+      average: null,
+      standardDeviation: null,
+      threshold: null,
+    };
+    let velocityFlag = false;
+
+    if (historyDays >= VELOCITY_MIN_BASELINE_DAYS) {
+      const samples = dailyNet.slice(1, historyDays + 1).map(toUnits);
+      const average = samples.reduce((acc, v) => acc + v, 0) / samples.length;
+      const variance =
+        samples.reduce((acc, v) => acc + (v - average) ** 2, 0) / samples.length;
+      const standardDeviation = Math.sqrt(variance);
+      const threshold = average + VELOCITY_STDDEV_THRESHOLD * standardDeviation;
+
+      baseline = {
+        sampleDays: samples.length,
+        average: average.toFixed(7),
+        standardDeviation: standardDeviation.toFixed(7),
+        threshold: threshold.toFixed(7),
+      };
+      velocityFlag = currentRate > threshold;
+    }
+
+    return success(res, {
+      accountId: id,
+      asset: normalizeAsset("XLM", null, "native"),
+      windows,
+      currentRate: currentRate.toFixed(7),
+      baseline,
+      velocityFlag,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 /**
  * GET /account/:id/volume?days=30
  */
