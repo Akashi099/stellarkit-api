@@ -68,6 +68,7 @@ This project is ideal for:
 - [Account Endpoints Guide](docs/account-endpoints.md) - Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint
 - [Transaction Endpoints Guide](docs/transaction-endpoints.md) - Transaction and operation endpoints for building explorers and submission tools, with curl examples and usage patterns
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
+- [Rate Limiting Strategies Guide](docs/rate-limiting-strategies.md) - Practical guide for high-volume apps: request batching, caching, `?fresh=true` timing, endpoint polling priority, and a complete exponential backoff implementation
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
