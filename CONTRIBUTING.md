@@ -12,6 +12,7 @@ Thank you for your interest in contributing! StellarKit API participates in the 
 - [📋 How to Contribute](#how-to-contribute)
 - [🚫 What Not to Commit](#-what-not-to-commit)
 - [✅ PR Checklist](#pr-checklist)
+- [🧩 Code Patterns](#-code-patterns)
 - [🧱 Code Style](#-code-style)
 - [🔍 Linting](#-linting)
 - [💬 Questions?](#-questions)
@@ -85,9 +86,24 @@ Changelog-worthy release notes go in [`CHANGELOG.md`](CHANGELOG.md). Reusable he
 - [ ] `npm test` passes
 - [ ] New functionality has tests
 - [ ] Code follows existing patterns (async/await, centralised error handling)
+- [ ] New endpoints pass the checklist in the [Code Patterns Guide](docs/code-patterns.md#checklist)
 - [ ] If adding new middleware, routes, or utilities, they follow the conventions in [docs/project-structure.md](docs/project-structure.md)
 - [ ] PR description explains what was changed and why
 - [ ] Issue number is referenced in the PR description
+
+---
+
+## 🧩 Code Patterns
+
+Most review feedback on new endpoints comes from the same five patterns. The **[Code Patterns Guide](docs/code-patterns.md)** shows the wrong and correct approach for each one, with the helper to use:
+
+1. **[Horizon instance usage](docs/code-patterns.md#1-horizon-instance-usage)**: import `server` and `sorobanServer` from `src/config/stellar.js`. Never create your own.
+2. **[Response envelope shape](docs/code-patterns.md#2-response-envelope-shape)**: send responses with `success(res, data)`. Errors go through `next(err)`.
+3. **[Amount formatting](docs/code-patterns.md#3-amount-formatting)**: return seven-decimal strings from `formatAmount` or `parseStellarAmount`, and sum amounts in stroops.
+4. **[Cache integration](docs/code-patterns.md#4-cache-integration)**: use the shared `cacheService` with TTLs from `cacheConfig`, an `X-Cache` header, and `?fresh=true`.
+5. **[Error handling flow](docs/code-patterns.md#5-error-handling-flow)**: validate input with `validators.js`, throw `StellarKitError`, and let `errorHandler` respond.
+
+Read it before you add an endpoint.
 
 ---
 

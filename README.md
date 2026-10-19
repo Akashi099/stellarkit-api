@@ -46,6 +46,8 @@ This project is ideal for:
 - [Getting Started Guide](docs/getting-started.md) - Set up the project and make your first API calls
 - [SEP Integration Guide](docs/sep-integration.md) - Use StellarKit discovery, account, asset, fee, and monitoring endpoints in SEP-10, SEP-24, and SEP-31 workflows
 - [Soroban Integration Guide](docs/soroban-integration.md) - End-to-end workflow for querying contract state, monitoring events, checking expiry, and simulating invocations
+- [Soroban Contract Monitoring Guide](docs/soroban-monitoring.md) - Monitor deployed contracts: expiry, storage changes, upgrades, caller activity and failure rates, and network Soroban stats, with a complete alerting dashboard example
+- [Code Patterns Guide](docs/code-patterns.md) - Required patterns for new endpoints (Horizon instance, response envelope, amount formatting, caching, error handling), with wrong and correct examples
 - [Soroban Endpoints Guide](docs/soroban.md) — Soroban contract endpoints: what Soroban is, how contract IDs work, and how to inspect deployed contracts via `/soroban/contract/:id`, `/soroban/contract/:id/storage`, and `/soroban/contract/:id/functions`
 - [Production Deployment Guide](docs/deployment.md) - Deploy to production with Node.js, Docker, Railway, Render, or Fly.io
 - [API Design Guidelines](docs/api-design.md) - Design conventions and response patterns
@@ -90,6 +92,7 @@ This project is ideal for:
 | GET | `/network/validator-quorum` | Current quorum health status | `fresh` |
 | GET | `/network/base-fee` | Current network base fee in stroops and XLM | `fresh` |
 | GET | `/network/fee-percentiles` | Fee distribution percentiles from recent activity | `fresh` |
+| GET | `/network/soroban-stats` | Soroban share of the last 24h of operations, invocation count, and Soroban fee revenue | `fresh` |
 
 ### Fees
 
@@ -234,7 +237,7 @@ A Soroban contract is referenced by a **contract ID**, which is the address used
 
 StellarKit API supports Soroban contract inspection through three endpoints: `GET /soroban/contract/:id` looks up contract details by contract ID, including the associated WASM hash and ledger metadata, `GET /soroban/contract/:id/storage` returns the contract's instance-storage entries, and `GET /soroban/contract/:id/functions` returns exported function names, parameter types, and return types parsed from the contract ABI. Together they make it easier to combine traditional Stellar account workflows with Soroban contract interactions.
 
-See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples and sample responses.
+See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples and sample responses. To monitor a deployed contract over time, see [docs/soroban-monitoring.md](docs/soroban-monitoring.md).
 
 ---
 
