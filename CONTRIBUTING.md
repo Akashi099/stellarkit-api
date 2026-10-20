@@ -34,6 +34,7 @@ Issues with the **`Stellar Wave`** label are part of the Stellar Wave Program on
 ## 📖 Documentation
 
 - [Testing Guide](docs/testing.md) — how the test suite is structured, how to run tests, mocking patterns, and coverage expectations
+- [Getting Started for Contributors](docs/getting-started-for-contributors.md) — environment setup, codebase orientation, response conventions, first test, and PR submission for first-time (Wave) contributors
 
 ---
 
