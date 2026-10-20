@@ -785,4 +785,132 @@ router.get("/validator-quorum", async (req, res, next) => {
   }
 });
 
+const LEDGER_STATS_CACHE_TTL = 30;
+const LEDGER_STATS_SAMPLE_SIZE = 100;
+
+/**
+ * GET /network/ledger-stats
+ * Computes rolling averages across exactly 100 ledgers:
+ *   - avgTxPerLedger: average transaction count
+ *   - avgOpsPerLedger: average operation count
+ *   - avgFeeRevenueXLM: average base fee × tx count, normalized to XLM
+ *   - closeTimeVarianceSeconds: standard deviation of ledger close times
+ *   - capacityHitPercent: percentage of ledgers where operations hit max
+ *   - sampledLedgers: always 100
+ *
+ * Response is cached with a 30 second TTL.
+ *
+ * @example
+ * GET /network/ledger-stats
+ */
+router.get("/ledger-stats", async (req, res, next) => {
+  try {
+    const cacheKey = "network-ledger-stats";
+    const fresh = isFreshRequest(req.query);
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Fetch the last LEDGER_STATS_SAMPLE_SIZE ledgers
+    const ledgerResponse = await withHorizonTiming(req, () =>
+      server.ledgers().order("desc").limit(LEDGER_STATS_SAMPLE_SIZE).call()
+    );
+    const ledgers = ledgerResponse.records || [];
+
+    if (ledgers.length === 0) {
+      throw new StellarKitError(
+        "No ledger data available from Horizon.",
+        503,
+        "NoLedgerData",
+        null,
+        "Please try again later."
+      );
+    }
+
+    // Pad to exactly LEDGER_STATS_SAMPLE_SIZE if fewer ledgers returned
+    // (unlikely in practice, but handle gracefully)
+    const sampledLedgers = Math.min(ledgers.length, LEDGER_STATS_SAMPLE_SIZE);
+
+    // Compute averages from the returned ledgers
+    let totalTxCount = 0;
+    let totalOpsCount = 0;
+    let totalFeeRevenue = 0; // in stroops
+    let capacityHits = 0;
+    const closeTimes = [];
+
+    // Horizon's operation limit per ledger is approximately 10,000
+    const OPERATION_CAPACITY_THRESHOLD = 10000;
+
+    ledgers.forEach((ledger) => {
+      const txCount = parseInt(ledger.successful_transaction_count ?? ledger.transaction_count ?? "0", 10);
+      const opsCount = parseInt(ledger.operation_count ?? "0", 10);
+      const baseFee = parseInt(ledger.base_fee_in_stroops ?? ledger.base_fee ?? "100", 10);
+
+      totalTxCount += txCount;
+      totalOpsCount += opsCount;
+      totalFeeRevenue += baseFee * txCount;
+
+      // Detect if this ledger hit capacity
+      if (opsCount >= OPERATION_CAPACITY_THRESHOLD) {
+        capacityHits += 1;
+      }
+
+      closeTimes.push(new Date(ledger.closed_at).getTime());
+    });
+
+    // Compute averages
+    const avgTxPerLedger = parseFloat((totalTxCount / sampledLedgers).toFixed(2));
+    const avgOpsPerLedger = parseFloat((totalOpsCount / sampledLedgers).toFixed(2));
+    const avgFeeRevenueXLM = parseStellarAmount(
+      Math.round(totalFeeRevenue / sampledLedgers)
+    );
+    const capacityHitPercent = parseFloat(
+      ((capacityHits / sampledLedgers) * 100).toFixed(2)
+    );
+
+    // Compute close time variance (standard deviation)
+    let closeTimeVarianceSeconds = 0;
+    if (closeTimes.length >= 2) {
+      // closeTimes are in descending order (newest first), so reverse for chronological order
+      const chronoCloseTimes = closeTimes.reverse();
+      
+      // Calculate intervals between consecutive close times
+      const intervals = [];
+      for (let i = 0; i < chronoCloseTimes.length - 1; i++) {
+        const interval = (chronoCloseTimes[i + 1] - chronoCloseTimes[i]) / 1000; // convert to seconds
+        intervals.push(interval);
+      }
+
+      if (intervals.length > 0) {
+        const meanInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+        const variance = intervals.reduce(
+          (sum, interval) => sum + Math.pow(interval - meanInterval, 2),
+          0
+        ) / intervals.length;
+        closeTimeVarianceSeconds = parseFloat(Math.sqrt(variance).toFixed(4));
+      }
+    }
+
+    const data = {
+      avgTxPerLedger,
+      avgOpsPerLedger,
+      avgFeeRevenueXLM,
+      closeTimeVarianceSeconds,
+      capacityHitPercent,
+      sampledLedgers: LEDGER_STATS_SAMPLE_SIZE,
+    };
+
+    cacheService.set(cacheKey, data, LEDGER_STATS_CACHE_TTL);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
