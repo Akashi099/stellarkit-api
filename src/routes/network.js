@@ -550,6 +550,148 @@ router.get("/ledger-history", async (req, res, next) => {
   }
 });
 
+const TOP_ACCOUNTS_CACHE_TTL = 300; // 5 minutes
+const TOP_ACCOUNTS_DEFAULT_LIMIT = 10;
+const TOP_ACCOUNTS_MAX_LIMIT = 50;
+const TOP_ACCOUNTS_PERIOD_HOURS = 24;
+const TOP_ACCOUNTS_TX_FETCH_LIMIT = 200;
+
+/**
+ * GET /network/top-accounts
+ * Returns the most active Stellar accounts ranked by recent transaction count.
+ *
+ * Query params:
+ *   - limit (number, 1–50, default: 10) — Maximum number of accounts to return.
+ *   - fresh (boolean, default: false) — bypasses cache when set to "true"
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accounts: [
+ *         {
+ *           address:          <string>,
+ *           transactionCount: <number>,
+ *           operationCount:   <number>,
+ *           lastActiveAt:     <string>  // ISO 8601
+ *         }
+ *       ],
+ *       total:  <number>,
+ *       period: <string>  // e.g. "24h"
+ *     }
+ *   }
+ *
+ * Errors:
+ *   400 — limit is not an integer between 1 and 50
+ *
+ * Response is cached with a 5 minute TTL.
+ *
+ * @example
+ * GET /network/top-accounts
+ * GET /network/top-accounts?limit=25
+ */
+router.get("/top-accounts", async (req, res, next) => {
+  try {
+    const rawLimit =
+      req.query.limit !== undefined
+        ? req.query.limit
+        : TOP_ACCOUNTS_DEFAULT_LIMIT;
+    const parsed = parseInt(rawLimit, 10);
+
+    if (
+      !Number.isInteger(parsed) ||
+      parsed < 1 ||
+      parsed > TOP_ACCOUNTS_MAX_LIMIT
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: `limit must be a positive integer between 1 and ${TOP_ACCOUNTS_MAX_LIMIT}.`,
+        },
+      });
+    }
+
+    const limit = parsed;
+    const fresh = isFreshRequest(req.query);
+    const cacheKey = `network-top-accounts:${limit}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const txResponse = await withHorizonTiming(req, () =>
+      server.transactions().order("desc").limit(TOP_ACCOUNTS_TX_FETCH_LIMIT).call()
+    );
+    const records = txResponse.records || [];
+
+    const cutoff = Date.now() - TOP_ACCOUNTS_PERIOD_HOURS * 60 * 60 * 1000;
+    const accountsByAddress = new Map();
+
+    for (const tx of records) {
+      const closedAt = tx.created_at ? new Date(tx.created_at) : null;
+      if (!closedAt || Number.isNaN(closedAt.getTime())) continue;
+      if (closedAt.getTime() < cutoff) continue;
+
+      const address = tx.source_account;
+      if (!address) continue;
+
+      const operationCount = Number(tx.operation_count ?? 0);
+      const existing = accountsByAddress.get(address);
+
+      if (existing) {
+        existing.transactionCount += 1;
+        existing.operationCount += Number.isFinite(operationCount)
+          ? operationCount
+          : 0;
+        if (closedAt.getTime() > existing.lastActiveAtMs) {
+          existing.lastActiveAtMs = closedAt.getTime();
+        }
+      } else {
+        accountsByAddress.set(address, {
+          address,
+          transactionCount: 1,
+          operationCount: Number.isFinite(operationCount)
+            ? operationCount
+            : 0,
+          lastActiveAtMs: closedAt.getTime(),
+        });
+      }
+    }
+
+    const accounts = Array.from(accountsByAddress.values())
+      .sort((a, b) => {
+        if (b.transactionCount !== a.transactionCount) {
+          return b.transactionCount - a.transactionCount;
+        }
+        return b.lastActiveAtMs - a.lastActiveAtMs;
+      })
+      .slice(0, limit)
+      .map((account) => ({
+        address: account.address,
+        transactionCount: account.transactionCount,
+        operationCount: account.operationCount,
+        lastActiveAt: new Date(account.lastActiveAtMs).toISOString(),
+      }));
+
+    const data = {
+      accounts,
+      total: accounts.length,
+      period: `${TOP_ACCOUNTS_PERIOD_HOURS}h`,
+    };
+
+    cacheService.set(cacheKey, data, TOP_ACCOUNTS_CACHE_TTL);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 const ECOSYSTEM_STATS_CACHE_TTL = 300; // 5 minutes
 
 /**
