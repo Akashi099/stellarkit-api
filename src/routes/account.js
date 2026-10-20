@@ -1277,6 +1277,78 @@ router.get("/:id/trades", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/cross-asset-trades
+ * Returns path payments with at least one intermediate asset, including the
+ * full source-to-destination conversion path and effective exchange rate.
+ */
+router.get("/:id/cross-asset-trades", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    let query = server.payments().forAccount(id).limit(limit).order(order);
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    const pathPaymentTypes = new Set([
+      "path_payment_strict_send",
+      "path_payment_strict_receive",
+    ]);
+    const trades = records
+      .filter((operation) => pathPaymentTypes.has(operation.type) && (operation.path || []).length > 0)
+      .map((operation) => {
+        const sourceType = operation.source_asset_type || "native";
+        const exitType = operation.asset_type || "native";
+        const entryAsset = normalizeAsset(
+          sourceType === "native" ? "XLM" : operation.source_asset_code,
+          sourceType === "native" ? null : operation.source_asset_issuer,
+          sourceType,
+        );
+        const exitAsset = normalizeAsset(
+          exitType === "native" ? "XLM" : operation.asset_code,
+          exitType === "native" ? null : operation.asset_issuer,
+          exitType,
+        );
+        const entryValue = Number(operation.source_amount ?? operation.source_max ?? 0);
+        const exitValue = Number(operation.amount || 0);
+        const intermediateAssets = operation.path.map((asset) => {
+          const type = asset.asset_type || "native";
+          return normalizeAsset(
+            type === "native" ? "XLM" : asset.asset_code,
+            type === "native" ? null : asset.asset_issuer,
+            type,
+          );
+        });
+
+        return {
+          tradeId: operation.id,
+          path: [entryAsset, ...intermediateAssets, exitAsset],
+          entryAsset,
+          exitAsset,
+          entryAmount: entryValue.toFixed(7),
+          exitAmount: exitValue.toFixed(7),
+          effectiveRate: (entryValue > 0 ? exitValue / entryValue : 0).toFixed(7),
+          timestamp: toISOTimestamp(operation.created_at),
+        };
+      });
+
+    const lastRecord = records[records.length - 1];
+    return success(res, {
+      trades,
+      total: trades.length,
+      limit,
+      cursor: lastRecord ? lastRecord.paging_token || null : null,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * Maps a raw Horizon offer record onto the StellarKit normalised shape:
  *   offerId, selling, buying, amount, price, lastModifiedLedger
  *
