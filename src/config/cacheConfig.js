@@ -87,6 +87,12 @@ const cacheTTL = {
     15000
   ),
 
+  /** /account/:id/liquidity-contribution — aggregated pool positions, same volatility as pool-positions */
+  liquidityContribution: msToSeconds(
+    process.env.CACHE_TTL_LIQUIDITY_CONTRIBUTION_MS,
+    15000
+  ),
+
   /** /account/:id/transaction-count — changes only on new submissions */
   transactionCount: msToSeconds(
     process.env.CACHE_TTL_TX_COUNT_MS,
@@ -97,6 +103,12 @@ const cacheTTL = {
   topMarkets: msToSeconds(
     process.env.CACHE_TTL_TOP_MARKETS_MS,
     60000
+  ),
+
+  /** /dex/volume-leaders — 24h asset volume ranking, refresh every 5 min by default */
+  volumeLeaders: msToSeconds(
+    process.env.CACHE_TTL_VOLUME_LEADERS_MS,
+    300000
   ),
 
   /** /dex/arbitrage — market conditions change rapidly, short TTL by default */

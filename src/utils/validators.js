@@ -22,6 +22,9 @@ function makeInvalidAccountIdError(accountId) {
     `""${String(accountId).slice(0, 60)}" is not a valid Stellar account address.`
   );
   err.isInvalidAccountId = true;
+  // Stable marker used by the minResponseTime middleware to identify
+  // synchronous format rejections (which never touch Horizon).
+  err.type = "InvalidAccountId";
   err.accountId = accountId;
   err.suggestion = "Account addresses start with G and are 56 characters long.";
   err.status = 400;
@@ -165,7 +168,11 @@ function validateAssetCode(code) {
 function validateLimit(limit, max = 100) {
   const parsed = parseInt(limit, 10);
   if (isNaN(parsed) || parsed < 1 || parsed > max) {
-    const err = new Error("limit must be a number between 1 and 100.");
+    const defaultMessage = "limit must be a number between 1 and 100.";
+    const message = max !== 100
+      ? `limit must be a number between 1 and ${max}.`
+      : defaultMessage;
+    const err = new Error(message);
     err.isInvalidLimit = true;
     err.status = 400;
     err.receivedValue = limit !== undefined ? String(limit).slice(0, 50) : undefined;
