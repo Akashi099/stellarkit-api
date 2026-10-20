@@ -67,6 +67,7 @@ This project is ideal for:
 - [Performance Guide](docs/performance.md) - Latency expectations, cache TTL tuning, Horizon optimization, and scaling recommendations
 - [Error Reference](docs/error-reference.md) - All error types, status codes, and suggested fixes
 - [Error Codes](docs/error-codes.md) - HTTP status code reference with descriptions, scenarios, and sample responses
+- [Error Recovery Guide](docs/error-recovery.md) - Programmatic recovery patterns for HorizonUnavailable, RateLimitExceeded, AccountNotFound, OrderBookEmpty, and InvalidCursor errors
 - [Account Endpoints Guide](docs/account-endpoints.md) - Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint
 - [Transaction Endpoints Guide](docs/transaction-endpoints.md) - Transaction and operation endpoints for building explorers and submission tools, with curl examples and usage patterns
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
