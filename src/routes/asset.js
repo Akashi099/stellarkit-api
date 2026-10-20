@@ -834,7 +834,6 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
 });
 
 /**
-<<<<<<< HEAD
  * Resolution map for the holder-growth time series.
  *
  * Each resolution defines a look-back window (`windowMs`) and a bucket size
@@ -930,102 +929,6 @@ function aggregateTrustlineGrowth(operations, windowStartMs, bucketMs) {
  * curl "http://localhost:3000/asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/holder-growth?resolution=30d"
  */
 router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
-=======
- * GET /asset/:code/:issuer/trading-volume
- *
- * Returns the asset's traded volume, trade count, and distinct traders over
- * the last 24 hours.
- */
-router.get("/:code/:issuer/trading-volume", async (req, res, next) => {
-  try {
-    const { code, issuer } = req.params;
-    validateAsset(code, issuer);
-
-    const assetCode = code.toUpperCase();
-    const asset = new Asset(assetCode, issuer);
-    const windowStartMs = Date.now() - 24 * 60 * 60 * 1000;
-    const traders = new Set();
-    let volume = 0;
-    let tradeCount = 0;
-    let cursor;
-    let done = false;
-
-    while (!done) {
-      let query = server.trades().forAsset(asset).order("desc").limit(200);
-      if (cursor) query = query.cursor(cursor);
-
-      const response = await query.call();
-      const records = response.records || [];
-      if (records.length === 0) break;
-
-      for (const trade of records) {
-        cursor = trade.paging_token;
-        const timestamp = new Date(trade.ledger_close_time).getTime();
-        if (!Number.isFinite(timestamp)) continue;
-        if (timestamp < windowStartMs) {
-          done = true;
-          break;
-        }
-
-        const isBaseAsset =
-          trade.base_asset_code?.toUpperCase() === assetCode &&
-          trade.base_asset_issuer === issuer;
-        const isCounterAsset =
-          trade.counter_asset_code?.toUpperCase() === assetCode &&
-          trade.counter_asset_issuer === issuer;
-        if (!isBaseAsset && !isCounterAsset) continue;
-
-        const amount = Number(
-          isBaseAsset ? trade.base_amount : trade.counter_amount,
-        );
-        if (Number.isFinite(amount)) volume += amount;
-        tradeCount += 1;
-        if (trade.base_account) traders.add(trade.base_account);
-        if (trade.counter_account) traders.add(trade.counter_account);
-      }
-
-      if (done || records.length < 200 || !cursor) break;
-    }
-
-    return success(res, {
-      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
-      volume24h: volume.toFixed(7),
-      tradeCount24h: tradeCount,
-      uniqueTraders24h: traders.size,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * GET /asset/:code/:issuer/issuance-history
- *
- * Returns a time series of supply changes for an asset over a specified time period.
- * Useful for tracking how asset supply has evolved over time.
- *
- * Query params:
- *   - resolution (string, optional) — Time window: "7d", "30d", or "90d". Default: "30d".
- *
- * Response:
- *   {
- *     success: true,
- *     data: {
- *       asset: { code, issuer, type },
- *       resolution: string,
- *       history: [{ timestamp: string, supply: string }],
- *       currentSupply: string,
- *       dataPoints: number
- *     }
- *   }
- *
- * Cache TTL: 5 minutes
- *
- * @example
- * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/issuance-history?resolution=7d
- */
-router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
->>>>>>> eb6b36037f8da9c66794fa19c7b9e67473674f5f
   try {
     const { code, issuer } = req.params;
     validateAsset(code, issuer);
@@ -1033,7 +936,6 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
     const assetCode = code.toUpperCase();
     const resolution = req.query.resolution || "30d";
 
-<<<<<<< HEAD
     if (!HOLDER_GROWTH_RESOLUTIONS[resolution]) {
       return res.status(400).json({
         success: false,
@@ -1047,20 +949,6 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
     }
 
     const cacheKey = `asset-holder-growth:${assetCode}:${issuer}:${resolution}`;
-=======
-    const validResolutions = ["7d", "30d", "90d"];
-    if (!validResolutions.includes(resolution)) {
-      const err = new Error(`Invalid resolution "${resolution}". Valid options are: ${validResolutions.join(", ")}.`);
-      err.isValidation = true;
-      err.status = 400;
-      err.field = "resolution";
-      err.receivedValue = resolution;
-      err.expectedFormat = validResolutions.join(", ");
-      throw err;
-    }
-
-    const cacheKey = `asset-issuance-history:${assetCode}:${issuer}:${resolution}`;
->>>>>>> eb6b36037f8da9c66794fa19c7b9e67473674f5f
     const fresh = isFreshRequest(req.query);
 
     if (!fresh) {
@@ -1071,7 +959,6 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
       }
     }
 
-<<<<<<< HEAD
     const { windowMs, bucketMs } = HOLDER_GROWTH_RESOLUTIONS[resolution];
     const windowStartMs = Date.now() - windowMs;
 
@@ -1080,37 +967,11 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
     // is a trustline deletion (see the change_trust mapping in account.js).
     const operationsResponse = await server
       .operations()
-=======
-    // Verify asset exists
-    const assetsResponse = await server
-      .assets()
-      .forCode(assetCode)
-      .forIssuer(issuer)
-      .call();
-
-    if (!assetsResponse.records || assetsResponse.records.length === 0) {
-      throw makeAssetNotFoundError(assetCode, issuer, NETWORK);
-    }
-
-    const asset = assetsResponse.records[0];
-    const currentSupply = asset.amount;
-
-    // Calculate time window
-    const now = Date.now();
-    const daysMap = { "7d": 7, "30d": 30, "90d": 90 };
-    const days = daysMap[resolution];
-    const startTime = now - (days * 24 * 60 * 60 * 1000);
-
-    // Fetch effects related to issuance (payments from issuer, trust line changes)
-    const effectsResponse = await server
-      .effects()
->>>>>>> eb6b36037f8da9c66794fa19c7b9e67473674f5f
       .forAccount(issuer)
       .order("desc")
       .limit(200)
       .call();
 
-<<<<<<< HEAD
     const records = (operationsResponse.records || []).filter(
       (op) =>
         op.type === "change_trust" &&
@@ -1127,35 +988,6 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
     };
 
     cacheService.set(cacheKey, data, cacheTTL.asset);
-=======
-    const records = effectsResponse.records || [];
-
-    // Build time series by sampling effects
-    const history = [];
-    const samplesPerDay = resolution === "7d" ? 4 : (resolution === "30d" ? 2 : 1);
-    const totalSamples = days * samplesPerDay;
-    const intervalMs = (days * 24 * 60 * 60 * 1000) / totalSamples;
-
-    // Generate sample timestamps
-    for (let i = 0; i < totalSamples; i++) {
-      const timestamp = new Date(startTime + (i * intervalMs)).toISOString();
-      // Simplified: use current supply as approximation (real implementation would track historical changes)
-      history.push({
-        timestamp,
-        supply: currentSupply,
-      });
-    }
-
-    const data = {
-      asset: normalizeAsset(assetCode, issuer, asset.asset_type),
-      resolution,
-      history,
-      currentSupply,
-      dataPoints: history.length,
-    };
-
-    cacheService.set(cacheKey, data, 300); // 5 minutes TTL
->>>>>>> eb6b36037f8da9c66794fa19c7b9e67473674f5f
     res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
@@ -1164,3 +996,4 @@ router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
 });
 
 module.exports = router;
+
