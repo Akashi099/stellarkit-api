@@ -1173,6 +1173,80 @@ router.get("/price-history/:sellAsset/:buyAsset", async (req, res, next) => {
 });
 
 /**
+ * GET /dex/maker-taker-ratio/:baseAsset/:counterAsset?days=7
+ * Returns trade-direction percentages and base-asset volume for a recent pair window.
+ * Horizon exposes whether the base asset was sold, but not a maker/taker flag;
+ * that direction is used as the available maker/taker proxy.
+ */
+router.get("/maker-taker-ratio/:baseAsset/:counterAsset", async (req, res, next) => {
+  try {
+    const { baseAsset, counterAsset } = req.params;
+    let base, counter;
+    try {
+      base = parseDexAssetParam(baseAsset);
+      counter = parseDexAssetParam(counterAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    const rawDays = req.query.days;
+    const requestedDays = rawDays === undefined ? 7 : Number(rawDays);
+    if (!Number.isInteger(requestedDays) || requestedDays < 1) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "days must be a positive integer." },
+      });
+    }
+    const days = Math.min(requestedDays, 30);
+    const to = new Date();
+    const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const tradesResponse = await server
+      .trades()
+      .forAssetPair(base, counter)
+      .order("desc")
+      .limit(200)
+      .call();
+    const trades = (tradesResponse.records || []).filter((trade) => {
+      const tradeTime = new Date(trade.ledger_close_time).getTime();
+      return tradeTime >= from.getTime() && tradeTime <= to.getTime();
+    });
+
+    if (trades.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(
+          base.isNative() ? "XLM" : base.getCode(),
+          counter.isNative() ? "XLM" : counter.getCode(),
+        ),
+      });
+    }
+
+    const makerTrades = trades.filter((trade) => trade.base_is_seller).length;
+    const makerPercent = Number(((makerTrades / trades.length) * 100).toFixed(2));
+    const takerPercent = Number((100 - makerPercent).toFixed(2));
+    const totalVolume = trades.reduce(
+      (sum, trade) => sum + Number(trade.base_amount || 0),
+      0,
+    );
+
+    return success(res, {
+      pair: `${baseAsset}/${counterAsset}`,
+      makerPercent,
+      takerPercent,
+      totalTrades: trades.length,
+      totalVolume: totalVolume.toFixed(7),
+      period: { days, from: from.toISOString(), to: to.toISOString() },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * @route GET /dex/market-summary/:baseAsset/:counterAsset
  * @desc Returns a 24-hour market summary for a trading pair including open, high, low,
  *   close prices, base/counter volume, trade count, and 24-hour price change metrics.
