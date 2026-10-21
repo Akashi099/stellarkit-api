@@ -54,6 +54,7 @@ This project is ideal for:
 - [Real-Time Guide](docs/real-time-guide.md) - Build real-time Stellar apps by combining SSE/WebSocket streams with REST calls and polling, handling interruptions, and a complete Node.js balance monitor
 - [Webhooks Guide](docs/webhooks.md) - Register webhooks, available events, payload shapes, signature verification, retries, and unregistration
 - [Webhook Security Guide](docs/webhook-security.md) - Verify HMAC-SHA256 delivery signatures in Node.js/Python/Go, handle invalid signatures, store secrets safely, and rotate with the dual-secret pattern
+- [Webhook Receiver Implementation Guide](docs/webhook-implementation.md) - Build an Express endpoint that verifies signatures, responds with 200 at the right time, de-duplicates retried deliveries, and handles errors, with a complete Node.js example
 - [Batch Endpoints Guide](docs/batch-endpoints.md) - Batch trust-status, freeze-status, and transaction status APIs, limits, and when to use batch vs individual
 - [DEX Endpoints Guide](docs/dex-endpoints.md) - All six DEX endpoints with curl examples, sample responses, and guidance on spread vs depth vs imbalance vs arbitrage
 - [Compliance Endpoints Guide](docs/compliance-endpoints.md) - All compliance and risk endpoints with curl examples, sample responses, and a complete compliance workflow
@@ -66,6 +67,7 @@ This project is ideal for:
 - [Performance Guide](docs/performance.md) - Latency expectations, cache TTL tuning, Horizon optimization, and scaling recommendations
 - [Error Reference](docs/error-reference.md) - All error types, status codes, and suggested fixes
 - [Error Codes](docs/error-codes.md) - HTTP status code reference with descriptions, scenarios, and sample responses
+- [Error Recovery Guide](docs/error-recovery.md) - Programmatic recovery patterns for HorizonUnavailable, RateLimitExceeded, AccountNotFound, OrderBookEmpty, and InvalidCursor errors
 - [Account Endpoints Guide](docs/account-endpoints.md) - Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint
 - [Transaction Endpoints Guide](docs/transaction-endpoints.md) - Transaction and operation endpoints for building explorers and submission tools, with curl examples and usage patterns
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
@@ -73,6 +75,10 @@ This project is ideal for:
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
+- [Getting Started for Contributors](docs/getting-started-for-contributors.md) - First-time contributor walkthrough: environment setup, codebase orientation, response conventions, first test, and PR checklist
+- [Tax Reporting Guide](docs/tax-reporting-guide.md) - Gather Stellar tax inputs (transactions, trades, fee spending, historical balances, cross-asset conversions) and compute cost basis
+- [Analytics Endpoints Guide](docs/analytics-endpoints.md) - Account analytics endpoints grouped by activity, volume, and compliance use cases, with an account health dashboard example
+- [SEP-10 Authentication Guide](docs/sep10-authentication.md) - Complete SEP-10 challenge-response flow using StellarKit for discovery, preflight, and inspection, with Node.js signing example
 
 ---
 
@@ -126,6 +132,8 @@ This project is ideal for:
 | GET | `/account/:id/smart-contract-interactions` | Soroban contract calls (contractId, function, timestamp, success) | `limit`, `cursor` |
 | GET | `/account/:id/freeze-status/:assetCode/:assetIssuer` | Check if an asset is frozen on an account | — |
 | GET | `/account/:id/can-receive/:assetCode/:assetIssuer` | Check if an account can receive a specific asset | — |
+| GET | `/account/:id/receive-capacity` | Remaining receive capacity per held asset before its trustline limit (absolute and percent) | — |
+| GET | `/account/:id/balance-velocity` | XLM balance change over 24h/7d/30d windows, with a flag when the 24h rate exceeds the historical mean by 2σ | — |
 | GET | `/account/:id/signers` | Account signers, their weights, and threshold configuration | — |
 | GET | `/account/:id/subentry-health` | Subentry usage and remaining capacity | — |
 | GET | `/account/:id/sponsorship` | Sponsorship relationships for the account — returns raw sponsored entries and accounts this account is sponsoring. **Prefer `/sponsorships` for new integrations.** Note: both endpoints will be consolidated in a future release (see issue #19). | — |
@@ -245,6 +253,7 @@ See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples
 - [docs/account-endpoints.md](docs/account-endpoints.md) — Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint.
 - [docs/webhooks.md](docs/webhooks.md) — Webhook registration, events, payloads, signature verification, retries, and unregistration.
 - [docs/webhook-security.md](docs/webhook-security.md) — Verifying HMAC-SHA256 delivery signatures (Node.js/Python/Go), handling invalid signatures, secret storage, and dual-secret rotation.
+- [docs/webhook-implementation.md](docs/webhook-implementation.md) — Building a webhook receiver in Node.js/Express: raw-body capture, HMAC verification, 200 timing, idempotency, and error handling.
 - [docs/batch-endpoints.md](docs/batch-endpoints.md) — Batch API endpoints, address/hash limits, per-entry errors, and when to use batch vs individual.
 
 ---
