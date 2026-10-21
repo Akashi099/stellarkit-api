@@ -1,126 +1,95 @@
-const request = require('supertest');
-const express = require('express');
+const request = require("supertest");
+const { Keypair } = require("@stellar/stellar-sdk");
+const cacheService = require("../../src/services/cache");
 
-jest.mock('stellar-sdk', () => {
-  const actual = jest.requireActual('stellar-sdk');
-  return {
-    ...actual,
-    Server: jest.fn(),
-  };
-});
-
-const StellarSdk = require('stellar-sdk');
-
+const ISSUER = Keypair.random().publicKey();
 const mockTradesCall = jest.fn();
-
-const mockServerInstance = {
-  trades: jest.fn(() => ({
-    forAssetPair: jest.fn(() => ({
-      order: jest.fn(() => ({
-        limit: jest.fn(() => ({
-          call: mockTradesCall,
-        })),
-      })),
-    })),
+const mockForAssetPair = jest.fn(() => ({
+  order: jest.fn(() => ({
+    limit: jest.fn(() => ({ call: mockTradesCall })),
   })),
-};
+}));
 
-StellarSdk.Server.mockImplementation(() => mockServerInstance);
+jest.mock("../../src/config/stellar", () => ({
+  server: {
+    trades: jest.fn(() => ({ forAssetPair: mockForAssetPair })),
+  },
+  horizonUrl: "https://horizon-testnet.stellar.org",
+  NETWORK: "testnet",
+  NETWORKS: {
+    testnet: "https://horizon-testnet.stellar.org",
+    mainnet: "https://horizon.stellar.org",
+  },
+}));
 
-const dexRouter = require('../../routes/dex');
+const app = require("../../src/index");
+const BASE_ASSET = "XLM:native";
+const COUNTER_ASSET = `USDC:${ISSUER}`;
+const endpoint = `/dex/maker-taker-ratio/${BASE_ASSET}/${COUNTER_ASSET}`;
 
-function buildApp() {
-  const app = express();
-  app.use('/dex', dexRouter);
-  return app;
-}
-
-function makeTrade({ baseIsMaker, createdAt }) {
+function makeTrade({ daysAgo = 1, baseAmount = "10.0000000", baseIsSeller }) {
   return {
-    base_is_seller: baseIsMaker,
-    created_at: createdAt,
-    base_amount: '10.0000000',
-    counter_amount: '20.0000000',
-    price: { n: 2, d: 1 },
+    ledger_close_time: new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString(),
+    base_amount: baseAmount,
+    base_is_seller: baseIsSeller,
   };
 }
 
-describe('GET /dex/maker-taker-ratio/:baseAsset/:counterAsset', () => {
-  let app;
-
+describe("GET /dex/maker-taker-ratio/:baseAsset/:counterAsset", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    app = buildApp();
+    cacheService.flush();
   });
 
-  test('returns makerPercent 70 and takerPercent 30 for 7 maker and 3 taker trades', async () => {
-    const now = new Date();
-    const trades = [];
-    for (let i = 0; i < 7; i += 1) {
-      trades.push(makeTrade({ baseIsMaker: true, createdAt: now.toISOString() }));
-    }
-    for (let i = 0; i < 3; i += 1) {
-      trades.push(makeTrade({ baseIsMaker: false, createdAt: now.toISOString() }));
-    }
-    mockTradesCall.mockResolvedValue({ records: trades });
+  it("aggregates recent trades and returns percentages summing to 100", async () => {
+    mockTradesCall.mockResolvedValue({
+      records: [
+        makeTrade({ baseAmount: "10.0000000", baseIsSeller: true }),
+        makeTrade({ baseAmount: "5.2500000", baseIsSeller: false }),
+      ],
+    });
 
-    const res = await request(app).get('/dex/maker-taker-ratio/XLM/USDC');
+    const res = await request(app).get(endpoint);
 
-    expect(res.status).toBe(200);
-    expect(res.body.makerPercent).toBe(70);
-    expect(res.body.takerPercent).toBe(30);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data).toMatchObject({
+      pair: `${BASE_ASSET}/${COUNTER_ASSET}`,
+      makerPercent: 50,
+      takerPercent: 50,
+      totalTrades: 2,
+      totalVolume: "15.2500000",
+    });
+    expect(res.body.data.makerPercent + res.body.data.takerPercent).toBe(100);
+    expect(res.body.data.period.days).toBe(7);
+    expect(mockForAssetPair).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "XLM" }),
+      expect.objectContaining({ code: "USDC" }),
+    );
   });
 
-  test('makerPercent and takerPercent always sum to 100', async () => {
-    const now = new Date();
-    const trades = [];
-    for (let i = 0; i < 4; i += 1) {
-      trades.push(makeTrade({ baseIsMaker: true, createdAt: now.toISOString() }));
-    }
-    for (let i = 0; i < 6; i += 1) {
-      trades.push(makeTrade({ baseIsMaker: false, createdAt: now.toISOString() }));
-    }
-    mockTradesCall.mockResolvedValue({ records: trades });
+  it("caps the requested period at 30 days and excludes older trades", async () => {
+    mockTradesCall.mockResolvedValue({
+      records: [
+        makeTrade({ daysAgo: 10, baseIsSeller: true }),
+        makeTrade({ daysAgo: 31, baseIsSeller: false }),
+      ],
+    });
 
-    const res = await request(app).get('/dex/maker-taker-ratio/XLM/USDC');
+    const res = await request(app).get(`${endpoint}?days=90`);
 
-    expect(res.status).toBe(200);
-    expect(res.body.makerPercent + res.body.takerPercent).toBe(100);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.period.days).toBe(30);
+    expect(res.body.data.totalTrades).toBe(1);
+    expect(res.body.data.totalVolume).toBe("10.0000000");
   });
 
-  test('?days=14 filters trades to the last 14 days', async () => {
-    const now = new Date();
-    const recent = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
-    const old = new Date(now.getTime() - 20 * 24 * 60 * 60 * 1000);
-
-    const trades = [
-      makeTrade({ baseIsMaker: true, createdAt: recent.toISOString() }),
-      makeTrade({ baseIsMaker: true, createdAt: recent.toISOString() }),
-      makeTrade({ baseIsMaker: false, createdAt: recent.toISOString() }),
-      makeTrade({ baseIsMaker: false, createdAt: old.toISOString() }),
-      makeTrade({ baseIsMaker: false, createdAt: old.toISOString() }),
-    ];
-    mockTradesCall.mockResolvedValue({ records: trades });
-
-    const res = await request(app).get('/dex/maker-taker-ratio/XLM/USDC?days=14');
-
-    expect(res.status).toBe(200);
-    expect(res.body.makerPercent).toBe(67);
-    expect(res.body.takerPercent).toBe(33);
-  });
-
-  test('returns OrderBookEmpty error for a pair with no trade history', async () => {
+  it("returns OrderBookEmpty when no trade history exists", async () => {
     mockTradesCall.mockResolvedValue({ records: [] });
 
-    const res = await request(app).get('/dex/maker-taker-ratio/XLM/USDC');
+    const res = await request(app).get(endpoint);
 
-    expect(res.status).toBe(404);
-    expect(res.body.error).toBe('OrderBookEmpty');
-  });
-
-  test('?days=31 returns HTTP 400', async () => {
-    const res = await request(app).get('/dex/maker-taker-ratio/XLM/USDC?days=31');
-
-    expect(res.status).toBe(400);
+    expect(res.statusCode).toBe(404);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.type).toBe("OrderBookEmpty");
   });
 });

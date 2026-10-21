@@ -775,6 +775,7 @@ PORT=4000 node scripts/ws-client-demo.js
 
 ## Related Documentation
 
+- [Advanced Streaming Patterns](streaming-advanced.md) — Reconnection with exponential backoff, managing multiple streams, client-side filtering, graceful shutdown, and memory management
 - [Getting Started Guide](getting-started.md) — Initial setup and environment variables
 - [Response Format Guide](response-format.md) — Normalised response shapes used across the API
 - [Rate Limiting](rate-limiting.md) — Request limits and retry strategies

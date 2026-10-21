@@ -498,6 +498,7 @@ Continue polling `GET $DIRECT_PAYMENT_SERVER/transactions/$SEP31_ID` or use a SE
 
 ## Related documentation
 
+- [SEP-10 Authentication Guide](sep10-authentication.md) — complete challenge-response flow with Node.js signing example and pitfalls
 - [Getting Started](getting-started.md)
 - [Account Endpoints](account-endpoints.md)
 - [Streaming](streaming.md)
