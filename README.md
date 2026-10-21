@@ -249,7 +249,7 @@ See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples
 
 ---
 
-## Documentation
+## Additional Soroban Resources
 
 - [docs/sep-integration.md](docs/sep-integration.md) — SEP-10 authentication, SEP-24 hosted transfers, and SEP-31 cross-border payment workflows using StellarKit.
 - [docs/soroban.md](docs/soroban.md) — Soroban contract endpoints: what Soroban is, how contract IDs work, and how to inspect deployed contracts via `/soroban/contract/:id`, `/soroban/contract/:id/storage`, and `/soroban/contract/:id/functions`.
