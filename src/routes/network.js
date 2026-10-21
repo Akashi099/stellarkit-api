@@ -678,4 +678,154 @@ router.get("/ledger-stats", async (req, res, next) => {
   }
 });
 
+
+const SOROBAN_STATS_PERIOD = "24h";
+const SOROBAN_STATS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SOROBAN_STATS_PAGE_SIZE = 200;
+// Bounds the Horizon scan. On busy networks the scan budget runs out before
+// the 24h boundary is reached; `windowCovered` reports when that happens.
+const SOROBAN_STATS_MAX_PAGES = 10;
+
+/** Operation types that only exist to drive Soroban contracts. */
+const SOROBAN_OPERATION_TYPES = new Set([
+  "invoke_host_function",
+  "extend_footprint_ttl",
+  "restore_footprint",
+]);
+
+/**
+ * Returns the parent transaction embedded by `.join("transactions")`.
+ *
+ * Depending on the SDK version the joined record is exposed either directly on
+ * `transaction` or on `transaction_attr` (with `transaction` replaced by a
+ * link-follower function), so both are checked.
+ *
+ * @param {object} op - Horizon operation record
+ * @returns {object|null}
+ */
+function getJoinedTransaction(op) {
+  if (op.transaction_attr && typeof op.transaction_attr === "object") {
+    return op.transaction_attr;
+  }
+  if (op.transaction && typeof op.transaction === "object") {
+    return op.transaction;
+  }
+  return null;
+}
+
+/**
+ * GET /network/soroban-stats
+ *
+ * Reports how much of recent network activity is Soroban-related, scanning
+ * operations newest-first back to the start of the 24h window.
+ *
+ * Query params:
+ *   - fresh (boolean, default: false) — bypasses cache when set to "true"
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       period:                  "24h",
+ *       totalOperations:         <number>,  // operations scanned in the window
+ *       sorobanOperations:       <number>,  // invoke_host_function + TTL extend/restore
+ *       invocations24h:          <number>,  // invoke_host_function only
+ *       sorobanOperationPercent: <number>,  // 0–100, two decimal places
+ *       sorobanFeeRevenueXLM:    <string>,  // seven-decimal XLM, fees charged on Soroban transactions
+ *       windowCovered:           <boolean>  // false when the scan limit was hit before 24h
+ *     }
+ *   }
+ *
+ * Failed transactions are included: they still consume ledger capacity and
+ * are still charged fees.
+ *
+ * @example
+ * GET /network/soroban-stats
+ * GET /network/soroban-stats?fresh=true
+ */
+router.get("/soroban-stats", async (req, res, next) => {
+  try {
+    const cacheKey = "network-soroban-stats";
+    const fresh = isFreshRequest(req.query);
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const windowStart = Date.now() - SOROBAN_STATS_WINDOW_MS;
+    const feeByTransaction = new Map();
+    let totalOperations = 0;
+    let sorobanOperations = 0;
+    let invocations = 0;
+    let windowCovered = false;
+    let cursor;
+
+    for (let page = 0; page < SOROBAN_STATS_MAX_PAGES && !windowCovered; page++) {
+      let query = server
+        .operations()
+        .join("transactions")
+        .includeFailed(true)
+        .order("desc")
+        .limit(SOROBAN_STATS_PAGE_SIZE);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at).getTime() < windowStart) {
+          windowCovered = true;
+          break;
+        }
+
+        totalOperations += 1;
+        if (!SOROBAN_OPERATION_TYPES.has(op.type)) continue;
+
+        sorobanOperations += 1;
+        if (op.type === "invoke_host_function") invocations += 1;
+
+        // A Soroban transaction holds exactly one operation, so its whole fee
+        // is Soroban revenue. Keyed by hash to never count a fee twice.
+        const tx = getJoinedTransaction(op);
+        const txHash = (tx && tx.hash) || op.transaction_hash;
+        if (txHash && !feeByTransaction.has(txHash)) {
+          feeByTransaction.set(txHash, parseStroops(tx && tx.fee_charged));
+        }
+      }
+
+      // Horizon has no more history to give, so the window is fully covered.
+      if (records.length < SOROBAN_STATS_PAGE_SIZE) windowCovered = true;
+    }
+
+    let feeRevenueStroops = 0;
+    for (const fee of feeByTransaction.values()) feeRevenueStroops += fee;
+
+    const sorobanOperationPercent =
+      totalOperations === 0
+        ? 0
+        : parseFloat(((sorobanOperations / totalOperations) * 100).toFixed(2));
+
+    const data = {
+      period: SOROBAN_STATS_PERIOD,
+      totalOperations,
+      sorobanOperations,
+      invocations24h: invocations,
+      sorobanOperationPercent,
+      sorobanFeeRevenueXLM: parseStellarAmount(feeRevenueStroops),
+      windowCovered,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.sorobanStats);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

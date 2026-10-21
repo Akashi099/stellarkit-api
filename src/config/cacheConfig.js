@@ -20,6 +20,7 @@
  *   CACHE_TTL_BALANCES_BY_SPONSOR_MS — /claimable-balances/by-sponsor (default: 30 000 ms)
  *   CACHE_TTL_FREEZE_CHECK_MS   — /account/:id/freeze-status     (default: 30 000 ms)
  *   CACHE_TTL_SIGNING_KEYS_MS   — /account/:id/signing-keys      (default: 20 000 ms)
+ *   CACHE_TTL_SOROBAN_STATS_MS  — /network/soroban-stats         (default: 60 000 ms)
  *
  * The legacy CACHE_TTL_MS variable is still respected as a global fallback so
  * existing deployments are not broken.
@@ -174,6 +175,12 @@ const cacheTTL = {
   /** /soroban/contract/:id/functions — contract ABI is immutable per WASM hash */
   contractFunctions: msToSeconds(
     process.env.CACHE_TTL_CONTRACT_FUNCTIONS_MS,
+    60000
+  ),
+
+  /** /network/soroban-stats — scans up to 2,000 operations, so cache for 60 s */
+  sorobanStats: msToSeconds(
+    process.env.CACHE_TTL_SOROBAN_STATS_MS,
     60000
   ),
 };

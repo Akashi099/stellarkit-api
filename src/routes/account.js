@@ -6378,12 +6378,129 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
   }
 });
 
+const OFFERS_SUMMARY_PAGE_SIZE = 200;
+// An account holds at most 1,000 subentries, so five full pages always cover
+// every open offer.
+const OFFERS_SUMMARY_MAX_PAGES = 5;
+const STROOPS_PER_UNIT = 10_000_000n;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Parses a Horizon decimal amount ("12.5000000") into integer stroops so that
+ * totals can be summed without floating-point drift.
+ *
+ * @param {string} amount
+ * @returns {bigint} Stroops, or 0n when the value is not a decimal amount.
+ */
+function amountToStroops(amount) {
+  const match = /^(\d+)(?:\.(\d{1,7}))?$/.exec(String(amount ?? "").trim());
+  if (!match) return 0n;
+  const [, whole, fraction = ""] = match;
+  return BigInt(whole) * STROOPS_PER_UNIT + BigInt(fraction.padEnd(7, "0"));
+}
+
+/**
+ * Formats integer stroops as a seven-decimal amount string.
+ *
+ * @param {bigint} stroops
+ * @returns {string}
+ */
+function stroopsToAmount(stroops) {
+  const whole = stroops / STROOPS_PER_UNIT;
+  const fraction = (stroops % STROOPS_PER_UNIT).toString().padStart(7, "0");
+  return `${whole}.${fraction}`;
+}
+
+/**
+ * Returns an offer's price (units of buying asset per unit of selling asset)
+ * as an exact ratio, preferring Horizon's `price_r` over the rounded decimal
+ * `price` string.
+ *
+ * @param {object} offer - Horizon offer record
+ * @returns {{ n: bigint, d: bigint }}
+ */
+function offerPriceRatio(offer) {
+  const ratio = offer.price_r;
+  if (ratio && Number(ratio.d) > 0) {
+    return { n: BigInt(ratio.n), d: BigInt(ratio.d) };
+  }
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(String(offer.price ?? "").trim());
+  if (!match) return { n: 0n, d: 1n };
+  const [, whole, fraction = ""] = match;
+  return { n: BigInt(whole + fraction), d: 10n ** BigInt(fraction.length) };
+}
+
+/**
+ * Adds `stroops` to the running total for `asset`, keyed by code and issuer.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @param {{ code: string, issuer: string|null }} asset
+ * @param {bigint} stroops
+ */
+function addAssetTotal(totals, asset, stroops) {
+  const key = `${asset.code}:${asset.issuer}`;
+  const entry = totals.get(key);
+  if (entry) {
+    entry.stroops += stroops;
+  } else {
+    totals.set(key, { asset, stroops });
+  }
+}
+
+/**
+ * Converts per-asset stroop totals to response entries, largest first.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @returns {Array<{ asset: object, totalAmount: string }>}
+ */
+function formatAssetTotals(totals) {
+  return Array.from(totals.values())
+    .sort((a, b) => (a.stroops === b.stroops ? 0 : a.stroops > b.stroops ? -1 : 1))
+    .map(({ asset, stroops }) => ({ asset, totalAmount: stroopsToAmount(stroops) }));
+}
+
+/**
+ * Fetches every open offer for an account, following Horizon pagination.
+ *
+ * @param {import('express').Request} req
+ * @param {string} accountId
+ * @returns {Promise<object[]>}
+ */
+async function fetchAllOffers(req, accountId) {
+  const offers = [];
+  let cursor;
+
+  for (let page = 0; page < OFFERS_SUMMARY_MAX_PAGES; page++) {
+    let query = server
+      .offers()
+      .forAccount(accountId)
+      .limit(OFFERS_SUMMARY_PAGE_SIZE)
+      .order("asc");
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    offers.push(...records);
+
+    if (records.length < OFFERS_SUMMARY_PAGE_SIZE) break;
+    cursor = records[records.length - 1].paging_token;
+  }
+
+  return offers;
+}
+
 /**
  * GET /account/:id/offers-summary
  *
- * Aggregates an account's open DEX offers per asset: total amount locked on
- * the selling side and total amount committed on the buying side, plus the
- * age of the oldest offer.
+ * A quick overview of an account's DEX position without fetching and parsing
+ * the full offers list:
+ *   - sellLocked:   per selling asset, the total amount offered for sale
+ *   - buyCommitted: per buying asset, the total amount the account will
+ *                   receive if every offer fills (amount × price)
+ *
+ * oldestOfferAgeDays is measured from each offer's `last_modified_time`;
+ * Horizon does not expose a creation time, so updating an offer resets its
+ * age. It is null when the account has no open offers.
  *
  * Responses are cached per account (X-Cache: HIT | MISS). Pass ?fresh=true
  * to bypass the cache.
@@ -6391,10 +6508,15 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
  * Response shape:
  *   {
  *     accountId: string,
- *     offerCount: number,
- *     assets: [{ asset, sellLocked, buyCommitted }],  // seven-decimal strings
+ *     totalOffers: number,
+ *     sellLocked:   [{ asset, totalAmount }],  // seven-decimal strings, largest first
+ *     buyCommitted: [{ asset, totalAmount }],  // seven-decimal strings, largest first
  *     oldestOfferAgeDays: number | null
  *   }
+ *
+ * Errors:
+ *   400 — invalid account ID
+ *   404 — account does not exist
  *
  * @example
  * GET /account/GABC.../offers-summary
@@ -6415,42 +6537,35 @@ router.get("/:id/offers-summary", async (req, res, next) => {
       }
     }
 
-    await withHorizonTiming(req, () => server.loadAccount(id));
+    // loadAccount rejects with a Horizon 404 for unknown accounts, which
+    // handleAccountNotFound turns into a structured AccountNotFound error.
+    const [, offers] = await Promise.all([
+      withHorizonTiming(req, () => server.loadAccount(id)),
+      fetchAllOffers(req, id),
+    ]);
 
-    const offersResponse = await server
-      .offers()
-      .forAccount(id)
-      .limit(200)
-      .order("desc")
-      .call();
-    const records = offersResponse.records || [];
-
-    const assetTotals = new Map();
-    const getEntry = (code, issuer, type) => {
-      const asset = normalizeAsset(code, issuer, type);
-      const key = `${asset.code}:${asset.issuer}`;
-      if (!assetTotals.has(key)) {
-        assetTotals.set(key, { asset, sellLocked: 0, buyCommitted: 0 });
-      }
-      return assetTotals.get(key);
-    };
-
+    const sellTotals = new Map();
+    const buyTotals = new Map();
     let oldestOfferTime = null;
-    for (const offer of records) {
-      const amount = parseFloat(offer.amount || "0");
-      const price = parseFloat(offer.price || "0");
 
-      getEntry(
-        offer.selling_asset_code,
-        offer.selling_asset_issuer,
-        offer.selling_asset_type,
-      ).sellLocked += amount;
-      getEntry(
-        offer.buying_asset_code,
-        offer.buying_asset_issuer,
-        offer.buying_asset_type,
-      ).buyCommitted += amount * price;
+    for (const offer of offers) {
+      const amountStroops = amountToStroops(offer.amount);
+      const { n, d } = offerPriceRatio(offer);
+      // amount × n / d, rounded half-up to the nearest stroop
+      const committedStroops = (amountStroops * n * 2n + d) / (2n * d);
 
+      addAssetTotal(
+        sellTotals,
+        normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+        amountStroops,
+      );
+      addAssetTotal(
+        buyTotals,
+        normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        committedStroops,
+      );
+
+      // new Date(null) is the epoch, not NaN, so a missing time must be skipped explicitly.
       const modified = offer.last_modified_time
         ? new Date(offer.last_modified_time).getTime()
         : NaN;
@@ -6461,16 +6576,13 @@ router.get("/:id/offers-summary", async (req, res, next) => {
 
     const data = {
       accountId: id,
-      offerCount: records.length,
-      assets: Array.from(assetTotals.values()).map((entry) => ({
-        asset: entry.asset,
-        sellLocked: toSevenDecimalString(entry.sellLocked),
-        buyCommitted: toSevenDecimalString(entry.buyCommitted),
-      })),
+      totalOffers: offers.length,
+      sellLocked: formatAssetTotals(sellTotals),
+      buyCommitted: formatAssetTotals(buyTotals),
       oldestOfferAgeDays:
         oldestOfferTime === null
           ? null
-          : Math.floor((Date.now() - oldestOfferTime) / (1000 * 60 * 60 * 24)),
+          : Math.floor((Date.now() - oldestOfferTime) / MS_PER_DAY),
     };
 
     cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
