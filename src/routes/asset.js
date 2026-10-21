@@ -1213,3 +1213,4 @@ const validResolutions = ["7d", "30d", "90d"];
 });
 
 module.exports = router;
+
