@@ -1212,5 +1212,203 @@ const validResolutions = ["7d", "30d", "90d"];
   }
 });
 
+/**
+ * GET /asset/:code/:issuer/price-history
+ *
+ * Returns historical price data for an asset (quoted in XLM) as a time series
+ * of OHLC (open-high-low-close) candles derived from DEX trades.
+ *
+ * Query params:
+ *   - resolution (string, default: "24h") — candle interval: "1h", "24h", "7d"
+ *   - limit (integer, 1–100, default: 50) — maximum number of candles to return
+ *   - fresh (boolean, default: false) — bypass cache when set to "true"
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       asset: { code, issuer, type },
+ *       quoteAsset: "XLM",
+ *       resolution,
+ *       candles: [
+ *         {
+ *           timestamp,
+ *           open: "0.1234567",
+ *           high: "0.1345678",
+ *           low: "0.1123456",
+ *           close: "0.1287654",
+ *           volume: "1234.5678900",
+ *           trades: 42
+ *         },
+ *         ...
+ *       ]
+ *     }
+ *   }
+ *
+ * Errors:
+ *   - 400: ValidationError — invalid asset format, resolution, or limit
+ *   - 404: AssetNotFound — asset does not exist
+ *
+ * @example
+ * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/price-history?resolution=1h&limit=24
+ */
+router.get("/:code/:issuer/price-history", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+
+    // Validate resolution parameter
+    const validResolutions = ["1h", "24h", "7d"];
+    const resolution = req.query.resolution || "24h";
+    
+    if (!validResolutions.includes(resolution)) {
+      const err = new Error(
+        `Invalid resolution "${resolution}". Valid options are: ${validResolutions.join(", ")}`
+      );
+      err.isValidation = true;
+      err.status = 400;
+      err.field = "resolution";
+      err.receivedValue = resolution;
+      err.expectedFormat = validResolutions.join(", ");
+      throw err;
+    }
+
+    // Validate limit parameter
+    const rawLimit = req.query.limit;
+    let limit = 50;
+    if (rawLimit !== undefined) {
+      const parsed = Number(rawLimit);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+        const err = new Error("Parameter 'limit' must be an integer between 1 and 100.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "limit";
+        err.receivedValue = rawLimit;
+        throw err;
+      }
+      limit = parsed;
+    }
+
+    const fresh = req.query.fresh === "true";
+    const cacheKey = `asset:price-history:${assetCode}:${issuer}:${resolution}:${limit}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Verify asset exists
+    const assetsResponse = await server
+      .assets()
+      .forCode(assetCode)
+      .forIssuer(issuer)
+      .limit(1)
+      .call();
+
+    if (!assetsResponse.records || assetsResponse.records.length === 0) {
+      throw makeAssetNotFoundError(assetCode, issuer, NETWORK);
+    }
+
+    // Resolution to milliseconds
+    const resolutionMs = {
+      "1h": 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+    };
+
+    const bucketMs = resolutionMs[resolution];
+    const now = Date.now();
+    const windowStart = now - (limit * bucketMs);
+
+    // Fetch trades for this asset pair
+    const asset = new Asset(assetCode, issuer);
+    const tradesResponse = await server
+      .trades()
+      .forAssetPair(asset, Asset.native())
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = tradesResponse.records || [];
+
+    // If no trades, return empty candles array
+    if (trades.length === 0) {
+      const data = {
+        asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+        quoteAsset: "XLM",
+        resolution,
+        candles: [],
+      };
+      cacheService.set(cacheKey, data, cacheTTL.assetPrice);
+      res.set("X-Cache", "MISS");
+      return success(res, data);
+    }
+
+    // Group trades into buckets
+    const buckets = new Map();
+
+    for (const trade of trades) {
+      const timestamp = new Date(trade.ledger_close_time).getTime();
+      if (Number.isNaN(timestamp) || timestamp < windowStart) continue;
+
+      const bucketKey = Math.floor(timestamp / bucketMs) * bucketMs;
+      
+      if (!buckets.has(bucketKey)) {
+        buckets.set(bucketKey, {
+          trades: [],
+          volume: 0,
+        });
+      }
+
+      const bucket = buckets.get(bucketKey);
+      const price = parseFloat(trade.price?.n || 0) / parseFloat(trade.price?.d || 1);
+      const amount = parseFloat(trade.base_amount || 0);
+
+      bucket.trades.push(price);
+      bucket.volume += amount;
+    }
+
+    // Convert buckets to OHLC candles
+    const candles = Array.from(buckets.entries())
+      .map(([timestamp, bucket]) => {
+        const prices = bucket.trades;
+        const open = prices[prices.length - 1]; // First trade in bucket (reversed)
+        const close = prices[0]; // Last trade in bucket
+        const high = Math.max(...prices);
+        const low = Math.min(...prices);
+
+        return {
+          timestamp: new Date(timestamp).toISOString(),
+          open: open.toFixed(7),
+          high: high.toFixed(7),
+          low: low.toFixed(7),
+          close: close.toFixed(7),
+          volume: bucket.volume.toFixed(7),
+          trades: prices.length,
+        };
+      })
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+      .slice(-limit); // Take only the requested number of candles
+
+    const data = {
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+      quoteAsset: "XLM",
+      resolution,
+      candles,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.assetPrice);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
 

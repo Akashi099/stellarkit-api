@@ -7011,6 +7011,165 @@ router.get("/:id/smart-contract-interactions", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/fee-spending
+ *
+ * Aggregates network fees paid by an account over a specified time period.
+ * Returns total fees in stroops and XLM, average fee per transaction, and a
+ * breakdown by operation type.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30) — how many days of history to analyze
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId,
+ *       period: { days, startDate, endDate },
+ *       totalFeesStroops: "123456",
+ *       totalFeesXLM: "0.0123456",
+ *       averageFeeXLM: "0.0001000",
+ *       transactionCount: 123,
+ *       breakdown: [
+ *         { operationType: "payment", count: 50, totalFeesXLM: "0.0050000" },
+ *         { operationType: "manage_offer", count: 30, totalFeesXLM: "0.0030000" },
+ *         ...
+ *       ]
+ *     }
+ *   }
+ *
+ * Errors:
+ *   - 400: InvalidParameter — days is not a valid integer or out of range
+ *   - 404: AccountNotFound — account does not exist on the network
+ *
+ * @example
+ * GET /account/GABC.../fee-spending?days=7
+ */
+router.get("/:id/fee-spending", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Validate days parameter
+    const rawDays = req.query.days;
+    let days = 30;
+    if (rawDays !== undefined) {
+      const parsed = Number(rawDays);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 90) {
+        const err = new Error("Parameter 'days' must be an integer between 1 and 90.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "days";
+        err.receivedValue = rawDays;
+        throw err;
+      }
+      days = parsed;
+    }
+
+    // Verify account exists
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - (days * 24 * 60 * 60 * 1000);
+    const startDate = new Date(windowStart).toISOString();
+    const endDate = new Date(now).toISOString();
+
+    let totalFeesStroops = 0n;
+    let transactionCount = 0;
+    const breakdownMap = new Map(); // operationType -> { count, totalFees }
+    let cursor;
+
+    // Paginate through transactions
+    for (;;) {
+      let query = server
+        .transactions()
+        .forAccount(id)
+        .limit(200)
+        .order("desc");
+      
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      if (records.length === 0) break;
+
+      for (const tx of records) {
+        const createdAt = new Date(tx.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        
+        // Stop if we've gone past the time window
+        if (createdAt < windowStart) {
+          cursor = null; // Signal we're done
+          break;
+        }
+
+        cursor = tx.paging_token;
+
+        // Only count successful transactions
+        if (tx.successful !== true) continue;
+
+        const fee = BigInt(tx.fee_charged || tx.max_fee || 0);
+        totalFeesStroops += fee;
+        transactionCount++;
+
+        // Get operation details for this transaction
+        try {
+          const opResponse = await withHorizonTiming(req, () =>
+            server.operations().forTransaction(tx.id).limit(200).call()
+          );
+
+          for (const op of opResponse.records || []) {
+            const opType = op.type || "unknown";
+            const existing = breakdownMap.get(opType) || { count: 0, totalFees: 0n };
+            existing.count++;
+            // Distribute the transaction fee evenly across operations
+            existing.totalFees += fee / BigInt(tx.operation_count || 1);
+            breakdownMap.set(opType, existing);
+          }
+        } catch (opErr) {
+          // If we can't get operations, just continue (edge case)
+          console.error(`Failed to fetch operations for tx ${tx.id}:`, opErr.message);
+        }
+      }
+
+      // If cursor is null, we've processed all relevant transactions
+      if (!cursor || records.length < 200) break;
+    }
+
+    // Convert breakdown map to array
+    const breakdown = Array.from(breakdownMap.entries())
+      .map(([operationType, data]) => ({
+        operationType,
+        count: data.count,
+        totalFeesXLM: stroopsToAmount(data.totalFees),
+      }))
+      .sort((a, b) => b.count - a.count); // Sort by count descending
+
+    const totalFeesXLM = stroopsToAmount(totalFeesStroops);
+    const averageFeeXLM = transactionCount > 0
+      ? stroopsToAmount(totalFeesStroops / BigInt(transactionCount))
+      : "0.0000000";
+
+    return success(res, {
+      accountId: id,
+      period: {
+        days,
+        startDate,
+        endDate,
+      },
+      totalFeesStroops: totalFeesStroops.toString(),
+      totalFeesXLM,
+      averageFeeXLM,
+      transactionCount,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
 
 // SHELL_SYNC_MARKER
