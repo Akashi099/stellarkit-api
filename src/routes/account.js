@@ -1277,6 +1277,78 @@ router.get("/:id/trades", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/cross-asset-trades
+ * Returns path payments with at least one intermediate asset, including the
+ * full source-to-destination conversion path and effective exchange rate.
+ */
+router.get("/:id/cross-asset-trades", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    let query = server.payments().forAccount(id).limit(limit).order(order);
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    const pathPaymentTypes = new Set([
+      "path_payment_strict_send",
+      "path_payment_strict_receive",
+    ]);
+    const trades = records
+      .filter((operation) => pathPaymentTypes.has(operation.type) && (operation.path || []).length > 0)
+      .map((operation) => {
+        const sourceType = operation.source_asset_type || "native";
+        const exitType = operation.asset_type || "native";
+        const entryAsset = normalizeAsset(
+          sourceType === "native" ? "XLM" : operation.source_asset_code,
+          sourceType === "native" ? null : operation.source_asset_issuer,
+          sourceType,
+        );
+        const exitAsset = normalizeAsset(
+          exitType === "native" ? "XLM" : operation.asset_code,
+          exitType === "native" ? null : operation.asset_issuer,
+          exitType,
+        );
+        const entryValue = Number(operation.source_amount ?? operation.source_max ?? 0);
+        const exitValue = Number(operation.amount || 0);
+        const intermediateAssets = operation.path.map((asset) => {
+          const type = asset.asset_type || "native";
+          return normalizeAsset(
+            type === "native" ? "XLM" : asset.asset_code,
+            type === "native" ? null : asset.asset_issuer,
+            type,
+          );
+        });
+
+        return {
+          tradeId: operation.id,
+          path: [entryAsset, ...intermediateAssets, exitAsset],
+          entryAsset,
+          exitAsset,
+          entryAmount: entryValue.toFixed(7),
+          exitAmount: exitValue.toFixed(7),
+          effectiveRate: (entryValue > 0 ? exitValue / entryValue : 0).toFixed(7),
+          timestamp: toISOTimestamp(operation.created_at),
+        };
+      });
+
+    const lastRecord = records[records.length - 1];
+    return success(res, {
+      trades,
+      total: trades.length,
+      limit,
+      cursor: lastRecord ? lastRecord.paging_token || null : null,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * Maps a raw Horizon offer record onto the StellarKit normalised shape:
  *   offerId, selling, buying, amount, price, lastModifiedLedger
  *
@@ -6942,3 +7014,362 @@ router.get("/:id/smart-contract-interactions", async (req, res, next) => {
 module.exports = router;
 
 // SHELL_SYNC_MARKER
+
+/**
+ * Evaluates claimable balance predicate conditions
+ * @param {object} predicate - Predicate object from Horizon
+ * @param {number} currentTimeMs - Current time in milliseconds
+ * @returns {object} { predicatesMet: string[], predicatesNotMet: string[], claimableAt: string|null }
+ */
+function evaluateClaimablePredicate(predicate, currentTimeMs) {
+  const predicatesMet = [];
+  const predicatesNotMet = [];
+  let claimableAt = null;
+
+  if (!predicate) {
+    predicatesMet.push("unconditional");
+    return { predicatesMet, predicatesNotMet, claimableAt };
+  }
+
+  const type = predicate.predicate_type;
+
+  if (type === "unconditional" || type === "predicate_unconditional") {
+    predicatesMet.push("unconditional");
+    return { predicatesMet, predicatesNotMet, claimableAt };
+  }
+
+  // Handle time-based predicates
+  if (type === "predicate_left_greater" || type === "predicate_left_greater_or_equal") {
+    const timestamp = parseInt(predicate.time_bounds?.min_time || 0, 10) * 1000;
+    if (currentTimeMs > timestamp || (type === "predicate_left_greater_or_equal" && currentTimeMs >= timestamp)) {
+      predicatesMet.push(`time_lock (after ${new Date(timestamp).toISOString()})`);
+    } else {
+      predicatesNotMet.push(`time_lock (before ${new Date(timestamp).toISOString()})`);
+      claimableAt = new Date(timestamp).toISOString();
+    }
+  }
+
+  if (type === "predicate_right_less" || type === "predicate_right_less_or_equal") {
+    const timestamp = parseInt(predicate.time_bounds?.max_time || 0, 10) * 1000;
+    if (currentTimeMs < timestamp || (type === "predicate_right_less_or_equal" && currentTimeMs <= timestamp)) {
+      predicatesMet.push(`time_window_open (until ${new Date(timestamp).toISOString()})`);
+    } else {
+      predicatesNotMet.push(`time_window_closed (expired at ${new Date(timestamp).toISOString()})`);
+    }
+  }
+
+  // Handle composite predicates (and/or)
+  if (type === "predicate_and") {
+    const left = evaluateClaimablePredicate(predicate.left_predicate, currentTimeMs);
+    const right = evaluateClaimablePredicate(predicate.right_predicate, currentTimeMs);
+    predicatesMet.push(...left.predicatesMet, ...right.predicatesMet);
+    predicatesNotMet.push(...left.predicatesNotMet, ...right.predicatesNotMet);
+    if (left.claimableAt || right.claimableAt) {
+      claimableAt = new Date(Math.max(
+        new Date(left.claimableAt || 0).getTime(),
+        new Date(right.claimableAt || 0).getTime()
+      )).toISOString();
+    }
+  }
+
+  if (type === "predicate_or") {
+    const left = evaluateClaimablePredicate(predicate.left_predicate, currentTimeMs);
+    const right = evaluateClaimablePredicate(predicate.right_predicate, currentTimeMs);
+    // For OR, if either side is eligible, it's eligible
+    const leftEligible = left.predicatesNotMet.length === 0;
+    const rightEligible = right.predicatesNotMet.length === 0;
+    if (leftEligible || rightEligible) {
+      predicatesMet.push(...(leftEligible ? left.predicatesMet : right.predicatesMet));
+    } else {
+      predicatesNotMet.push(...left.predicatesNotMet, ...right.predicatesNotMet);
+      claimableAt = new Date(Math.min(
+        new Date(left.claimableAt || Date.now()).getTime(),
+        new Date(right.claimableAt || Date.now()).getTime()
+      )).toISOString();
+    }
+  }
+
+  return { predicatesMet, predicatesNotMet, claimableAt };
+}
+
+/**
+ * GET /account/:id/claimable-balance-eligibility
+ *
+ * Returns detailed eligibility breakdown for each claimable balance sponsored to the account.
+ * For each balance, explains which predicate conditions are met, which are not, and when
+ * a time-locked balance becomes claimable.
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: <string>,
+ *       balances: [
+ *         {
+ *           balanceId: <string>,
+ *           asset: <string>,
+ *           amount: <string>,
+ *           isEligible: <boolean>,
+ *           predicatesMet: <string[]>,
+ *           predicatesNotMet: <string[]>,
+ *           claimableAt: <ISO8601 string or null>
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns 404 if the account does not exist.
+ *
+ * @example
+ * GET /account/GBRPYHIL2CI3WHZDTOOQFC6EB4CGQG5N3KBI5DOMMZMDBESIOXW32DT/claimable-balance-eligibility
+ */
+router.get("/:id/claimable-balance-eligibility", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Validate account ID
+    const accountIdError = validateAccountId(id);
+    if (accountIdError) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: accountIdError,
+        },
+      });
+    }
+
+    // Check if account exists
+    let account;
+    try {
+      account = await withHorizonTiming(req, () => server.accounts().accountId(id).call());
+    } catch (err) {
+      if (err.status === 404) {
+        return res.status(404).json(makeAccountNotFoundError(id));
+      }
+      throw err;
+    }
+
+    // Fetch claimable balances sponsored to this account
+    const cbResponse = await withHorizonTiming(req, () =>
+      server
+        .claimableBalances()
+        .claimant(id)
+        .order("desc")
+        .limit(200)
+        .call()
+    );
+
+    const balances = (cbResponse.records || []).map((cb) => {
+      const currentTimeMs = Date.now();
+      const { predicatesMet, predicatesNotMet, claimableAt } = evaluateClaimablePredicate(
+        cb.predicate,
+        currentTimeMs
+      );
+
+      // Determine if eligible (no unsatisfied predicates)
+      const isEligible = predicatesNotMet.length === 0;
+
+      // Format asset
+      let assetString;
+      if (cb.asset === "native") {
+        assetString = "XLM";
+      } else {
+        const [code, issuer] = cb.asset.split(":");
+        assetString = `${code}:${issuer}`;
+      }
+
+      return {
+        balanceId: cb.id,
+        asset: assetString,
+        amount: cb.amount,
+        isEligible,
+        predicatesMet,
+        predicatesNotMet,
+        claimableAt: isEligible ? null : claimableAt,
+      };
+    });
+
+    const data = {
+      accountId: id,
+      balances,
+    };
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /account/:id/balance-velocity
+ *
+ * Analyzes the rate of change in an account's balances over rolling time windows.
+ * Tracks how much each asset balance has changed in the last hour, 24 hours, and 7 days.
+ * Sets a velocityFlag when the change rate exceeds two standard deviations from the
+ * account's historical average (indicating unusual activity).
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: <string>,
+ *       balanceChanges: [
+ *         {
+ *           asset: <string>,
+ *           change1h: <string (7 decimals)>,
+ *           change24h: <string (7 decimals)>,
+ *           change7d: <string (7 decimals)>,
+ *           velocityFlag: <boolean>
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * All change values are formatted as seven-decimal strings and can be negative.
+ * velocityFlag is true when |change| > μ + 2σ from historical daily changes.
+ * Returns 404 if the account does not exist.
+ *
+ * @example
+ * GET /account/GBRPYHIL2CI3WHZDTOOQFC6EB4CGQG5N3KBI5DOMMZMDBESIOXW32DT/balance-velocity
+ */
+router.get("/:id/balance-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Validate account ID
+    const accountIdError = validateAccountId(id);
+    if (accountIdError) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: accountIdError,
+        },
+      });
+    }
+
+    // Check if account exists and get current balances
+    let account;
+    try {
+      account = await withHorizonTiming(req, () => server.accounts().accountId(id).call());
+    } catch (err) {
+      if (err.status === 404) {
+        return res.status(404).json(makeAccountNotFoundError(id));
+      }
+      throw err;
+    }
+
+    const currentBalances = {};
+    
+    // Build map of current balances
+    account.balances.forEach((balance) => {
+      if (balance.asset_type === "native") {
+        currentBalances["XLM"] = parseFloat(balance.balance);
+      } else {
+        const key = `${balance.asset_code}:${balance.asset_issuer}`;
+        currentBalances[key] = parseFloat(balance.balance);
+      }
+    });
+
+    // Fetch payment operations to analyze balance changes
+    const now = Date.now();
+    const timeWindows = {
+      "1h": now - 60 * 60 * 1000,
+      "24h": now - 24 * 60 * 60 * 1000,
+      "7d": now - 7 * 24 * 60 * 60 * 1000,
+    };
+
+    // Fetch payment and path_payment operations
+    const paymentsResponse = await withHorizonTiming(req, () =>
+      server
+        .payments()
+        .forAccount(id)
+        .order("desc")
+        .limit(200)
+        .call()
+    );
+
+    const payments = paymentsResponse.records || [];
+    const balanceChanges = {};
+
+    // Calculate balance changes by asset
+    payments.forEach((payment) => {
+      const operationTimestamp = new Date(payment.created_at).getTime();
+      
+      // Determine asset key
+      let assetKey;
+      if (payment.asset_type === "native" || payment.asset_code === "XLM") {
+        assetKey = "XLM";
+      } else {
+        assetKey = `${payment.asset_code}:${payment.asset_issuer}`;
+      }
+
+      // Initialize asset tracking if needed
+      if (!balanceChanges[assetKey]) {
+        balanceChanges[assetKey] = {
+          change1h: 0,
+          change24h: 0,
+          change7d: 0,
+          dailyChanges: [],
+        };
+      }
+
+      const amount = parseFloat(payment.amount);
+      const isReceived = payment.to === id;
+      const change = isReceived ? amount : -amount;
+
+      // Record by time window
+      if (operationTimestamp > timeWindows["1h"]) {
+        balanceChanges[assetKey].change1h += change;
+      }
+      if (operationTimestamp > timeWindows["24h"]) {
+        balanceChanges[assetKey].change24h += change;
+      }
+      if (operationTimestamp > timeWindows["7d"]) {
+        balanceChanges[assetKey].change7d += change;
+        
+        // Track daily change for velocity calculation
+        const dayIndex = Math.floor((now - operationTimestamp) / (24 * 60 * 60 * 1000));
+        if (!balanceChanges[assetKey].dailyChanges[dayIndex]) {
+          balanceChanges[assetKey].dailyChanges[dayIndex] = 0;
+        }
+        balanceChanges[assetKey].dailyChanges[dayIndex] += change;
+      }
+    });
+
+    // Calculate velocity flags
+    const result = Object.entries(balanceChanges).map(([asset, changes]) => {
+      // Compute historical statistics
+      const dailyChanges = changes.dailyChanges.filter((c) => c !== undefined);
+      let velocityFlag = false;
+
+      if (dailyChanges.length > 1) {
+        const mean = dailyChanges.reduce((a, b) => a + b, 0) / dailyChanges.length;
+        const variance = dailyChanges.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / dailyChanges.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Check if any recent change exceeds mean + 2σ
+        const recentChange = changes.change24h;
+        velocityFlag = Math.abs(recentChange - mean) > 2 * stdDev;
+      }
+
+      return {
+        asset,
+        change1h: changes.change1h.toFixed(7),
+        change24h: changes.change24h.toFixed(7),
+        change7d: changes.change7d.toFixed(7),
+        velocityFlag,
+      };
+    });
+
+    const data = {
+      accountId: id,
+      balanceChanges: result,
+    };
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
