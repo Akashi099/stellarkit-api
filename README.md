@@ -46,14 +46,18 @@ This project is ideal for:
 - [Getting Started Guide](docs/getting-started.md) - Set up the project and make your first API calls
 - [SEP Integration Guide](docs/sep-integration.md) - Use StellarKit discovery, account, asset, fee, and monitoring endpoints in SEP-10, SEP-24, and SEP-31 workflows
 - [Soroban Integration Guide](docs/soroban-integration.md) - End-to-end workflow for querying contract state, monitoring events, checking expiry, and simulating invocations
+- [Soroban Contract Monitoring Guide](docs/soroban-monitoring.md) - Monitor deployed contracts: expiry, storage changes, upgrades, caller activity and failure rates, and network Soroban stats, with a complete alerting dashboard example
+- [Code Patterns Guide](docs/code-patterns.md) - Required patterns for new endpoints (Horizon instance, response envelope, amount formatting, caching, error handling), with wrong and correct examples
 - [Soroban Endpoints Guide](docs/soroban.md) — Soroban contract endpoints: what Soroban is, how contract IDs work, and how to inspect deployed contracts via `/soroban/contract/:id`, `/soroban/contract/:id/storage`, and `/soroban/contract/:id/functions`
 - [Production Deployment Guide](docs/deployment.md) - Deploy to production with Node.js, Docker, Railway, Render, or Fly.io
 - [API Design Guidelines](docs/api-design.md) - Design conventions and response patterns
 - [Response Format Guide](docs/response-format.md) - Standard response envelopes, pagination, and data formats
 - [Streaming Guide](docs/streaming.md) - SSE and WebSocket streaming endpoints, event payloads, reconnection, and clean close handling
+- [Advanced Streaming Patterns](docs/streaming-advanced.md) - Production streaming patterns: exponential backoff reconnection, multi-stream management, client-side filtering, graceful shutdown, and memory management
 - [Real-Time Guide](docs/real-time-guide.md) - Build real-time Stellar apps by combining SSE/WebSocket streams with REST calls and polling, handling interruptions, and a complete Node.js balance monitor
 - [Webhooks Guide](docs/webhooks.md) - Register webhooks, available events, payload shapes, signature verification, retries, and unregistration
 - [Webhook Security Guide](docs/webhook-security.md) - Verify HMAC-SHA256 delivery signatures in Node.js/Python/Go, handle invalid signatures, store secrets safely, and rotate with the dual-secret pattern
+- [Webhook Receiver Implementation Guide](docs/webhook-implementation.md) - Build an Express endpoint that verifies signatures, responds with 200 at the right time, de-duplicates retried deliveries, and handles errors, with a complete Node.js example
 - [Batch Endpoints Guide](docs/batch-endpoints.md) - Batch trust-status, freeze-status, and transaction status APIs, limits, and when to use batch vs individual
 - [DEX Endpoints Guide](docs/dex-endpoints.md) - All six DEX endpoints with curl examples, sample responses, and guidance on spread vs depth vs imbalance vs arbitrage
 - [Compliance Endpoints Guide](docs/compliance-endpoints.md) - All compliance and risk endpoints with curl examples, sample responses, and a complete compliance workflow
@@ -66,6 +70,7 @@ This project is ideal for:
 - [Performance Guide](docs/performance.md) - Latency expectations, cache TTL tuning, Horizon optimization, and scaling recommendations
 - [Error Reference](docs/error-reference.md) - All error types, status codes, and suggested fixes
 - [Error Codes](docs/error-codes.md) - HTTP status code reference with descriptions, scenarios, and sample responses
+- [Error Recovery Guide](docs/error-recovery.md) - Programmatic recovery patterns for HorizonUnavailable, RateLimitExceeded, AccountNotFound, OrderBookEmpty, and InvalidCursor errors
 - [Account Endpoints Guide](docs/account-endpoints.md) - Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint
 - [Transaction Endpoints Guide](docs/transaction-endpoints.md) - Transaction and operation endpoints for building explorers and submission tools, with curl examples and usage patterns
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
@@ -73,6 +78,10 @@ This project is ideal for:
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
+- [Getting Started for Contributors](docs/getting-started-for-contributors.md) - First-time contributor walkthrough: environment setup, codebase orientation, response conventions, first test, and PR checklist
+- [Tax Reporting Guide](docs/tax-reporting-guide.md) - Gather Stellar tax inputs (transactions, trades, fee spending, historical balances, cross-asset conversions) and compute cost basis
+- [Analytics Endpoints Guide](docs/analytics-endpoints.md) - Account analytics endpoints grouped by activity, volume, and compliance use cases, with an account health dashboard example
+- [SEP-10 Authentication Guide](docs/sep10-authentication.md) - Complete SEP-10 challenge-response flow using StellarKit for discovery, preflight, and inspection, with Node.js signing example
 
 ---
 
@@ -90,6 +99,7 @@ This project is ideal for:
 | GET | `/network/validator-quorum` | Current quorum health status | `fresh` |
 | GET | `/network/base-fee` | Current network base fee in stroops and XLM | `fresh` |
 | GET | `/network/fee-percentiles` | Fee distribution percentiles from recent activity | `fresh` |
+| GET | `/network/soroban-stats` | Soroban share of the last 24h of operations, invocation count, and Soroban fee revenue | `fresh` |
 
 ### Fees
 
@@ -126,6 +136,8 @@ This project is ideal for:
 | GET | `/account/:id/smart-contract-interactions` | Soroban contract calls (contractId, function, timestamp, success) | `limit`, `cursor` |
 | GET | `/account/:id/freeze-status/:assetCode/:assetIssuer` | Check if an asset is frozen on an account | — |
 | GET | `/account/:id/can-receive/:assetCode/:assetIssuer` | Check if an account can receive a specific asset | — |
+| GET | `/account/:id/receive-capacity` | Remaining receive capacity per held asset before its trustline limit (absolute and percent) | — |
+| GET | `/account/:id/balance-velocity` | XLM balance change over 24h/7d/30d windows, with a flag when the 24h rate exceeds the historical mean by 2σ | — |
 | GET | `/account/:id/signers` | Account signers, their weights, and threshold configuration | — |
 | GET | `/account/:id/subentry-health` | Subentry usage and remaining capacity | — |
 | GET | `/account/:id/sponsorship` | Sponsorship relationships for the account — returns raw sponsored entries and accounts this account is sponsoring. **Prefer `/sponsorships` for new integrations.** Note: both endpoints will be consolidated in a future release (see issue #19). | — |
@@ -234,17 +246,18 @@ A Soroban contract is referenced by a **contract ID**, which is the address used
 
 StellarKit API supports Soroban contract inspection through three endpoints: `GET /soroban/contract/:id` looks up contract details by contract ID, including the associated WASM hash and ledger metadata, `GET /soroban/contract/:id/storage` returns the contract's instance-storage entries, and `GET /soroban/contract/:id/functions` returns exported function names, parameter types, and return types parsed from the contract ABI. Together they make it easier to combine traditional Stellar account workflows with Soroban contract interactions.
 
-See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples and sample responses.
+See [docs/soroban.md](docs/soroban.md) for a full walkthrough with curl examples and sample responses. To monitor a deployed contract over time, see [docs/soroban-monitoring.md](docs/soroban-monitoring.md).
 
 ---
 
-## Documentation
+## Additional Soroban Resources
 
 - [docs/sep-integration.md](docs/sep-integration.md) — SEP-10 authentication, SEP-24 hosted transfers, and SEP-31 cross-border payment workflows using StellarKit.
 - [docs/soroban.md](docs/soroban.md) — Soroban contract endpoints: what Soroban is, how contract IDs work, and how to inspect deployed contracts via `/soroban/contract/:id`, `/soroban/contract/:id/storage`, and `/soroban/contract/:id/functions`.
 - [docs/account-endpoints.md](docs/account-endpoints.md) — Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint.
 - [docs/webhooks.md](docs/webhooks.md) — Webhook registration, events, payloads, signature verification, retries, and unregistration.
 - [docs/webhook-security.md](docs/webhook-security.md) — Verifying HMAC-SHA256 delivery signatures (Node.js/Python/Go), handling invalid signatures, secret storage, and dual-secret rotation.
+- [docs/webhook-implementation.md](docs/webhook-implementation.md) — Building a webhook receiver in Node.js/Express: raw-body capture, HMAC verification, 200 timing, idempotency, and error handling.
 - [docs/batch-endpoints.md](docs/batch-endpoints.md) — Batch API endpoints, address/hash limits, per-entry errors, and when to use batch vs individual.
 
 ---

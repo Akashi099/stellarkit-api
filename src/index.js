@@ -704,6 +704,12 @@ app.get("/", (req, res) => {
         },
         {
           method: "GET",
+          path: "/network/soroban-stats",
+          description:
+            "Share of the last 24h of operations that are Soroban-related, invocation count, and Soroban fee revenue (cached; ?fresh=true bypasses cache)",
+        },
+        {
+          method: "GET",
           path: "/liquidity-pools/:id/trades",
           description: "Trade history for a liquidity pool",
         },
@@ -741,7 +747,7 @@ app.get("/", (req, res) => {
           method: "GET",
           path: "/account/:id/offers-summary",
           description:
-            "Aggregated open offer totals per asset (cached; ?fresh=true bypasses cache)",
+            "Open offer count, amount locked in sell offers and committed in buy offers per asset, and oldest offer age (cached; ?fresh=true bypasses cache)",
         },
         {
           method: "GET",

@@ -1277,6 +1277,78 @@ router.get("/:id/trades", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/cross-asset-trades
+ * Returns path payments with at least one intermediate asset, including the
+ * full source-to-destination conversion path and effective exchange rate.
+ */
+router.get("/:id/cross-asset-trades", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    let query = server.payments().forAccount(id).limit(limit).order(order);
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    const pathPaymentTypes = new Set([
+      "path_payment_strict_send",
+      "path_payment_strict_receive",
+    ]);
+    const trades = records
+      .filter((operation) => pathPaymentTypes.has(operation.type) && (operation.path || []).length > 0)
+      .map((operation) => {
+        const sourceType = operation.source_asset_type || "native";
+        const exitType = operation.asset_type || "native";
+        const entryAsset = normalizeAsset(
+          sourceType === "native" ? "XLM" : operation.source_asset_code,
+          sourceType === "native" ? null : operation.source_asset_issuer,
+          sourceType,
+        );
+        const exitAsset = normalizeAsset(
+          exitType === "native" ? "XLM" : operation.asset_code,
+          exitType === "native" ? null : operation.asset_issuer,
+          exitType,
+        );
+        const entryValue = Number(operation.source_amount ?? operation.source_max ?? 0);
+        const exitValue = Number(operation.amount || 0);
+        const intermediateAssets = operation.path.map((asset) => {
+          const type = asset.asset_type || "native";
+          return normalizeAsset(
+            type === "native" ? "XLM" : asset.asset_code,
+            type === "native" ? null : asset.asset_issuer,
+            type,
+          );
+        });
+
+        return {
+          tradeId: operation.id,
+          path: [entryAsset, ...intermediateAssets, exitAsset],
+          entryAsset,
+          exitAsset,
+          entryAmount: entryValue.toFixed(7),
+          exitAmount: exitValue.toFixed(7),
+          effectiveRate: (entryValue > 0 ? exitValue / entryValue : 0).toFixed(7),
+          timestamp: toISOTimestamp(operation.created_at),
+        };
+      });
+
+    const lastRecord = records[records.length - 1];
+    return success(res, {
+      trades,
+      total: trades.length,
+      limit,
+      cursor: lastRecord ? lastRecord.paging_token || null : null,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * Maps a raw Horizon offer record onto the StellarKit normalised shape:
  *   offerId, selling, buying, amount, price, lastModifiedLedger
  *
@@ -3460,6 +3532,287 @@ router.get(
     }
   },
 );
+
+/** Largest amount a Stellar balance can hold: INT64_MAX stroops. */
+const MAX_BALANCE_STROOPS = 9223372036854775807n;
+const STROOPS_PER_UNIT = 10_000_000n;
+
+/**
+ * Converts a Horizon decimal amount string (up to seven decimals) to BigInt
+ * stroops so capacity arithmetic stays exact across the full int64 range.
+ *
+ * @param {string|undefined} amount
+ * @returns {bigint}
+ */
+function amountToStroops(amount) {
+  const match = String(amount ?? "0").trim().match(/^(-?)(\d+)(?:\.(\d{1,7}))?$/);
+  if (!match) return 0n;
+  const [, sign, whole, fraction = ""] = match;
+  const stroops = BigInt(whole) * STROOPS_PER_UNIT + BigInt(fraction.padEnd(7, "0"));
+  return sign === "-" ? -stroops : stroops;
+}
+
+/**
+ * Formats BigInt stroops as a seven-decimal amount string.
+ *
+ * @param {bigint} stroops
+ * @returns {string}
+ */
+function stroopsToAmount(stroops) {
+  const sign = stroops < 0n ? "-" : "";
+  const abs = stroops < 0n ? -stroops : stroops;
+  const fraction = (abs % STROOPS_PER_UNIT).toString().padStart(7, "0");
+  return `${sign}${abs / STROOPS_PER_UNIT}.${fraction}`;
+}
+
+/**
+ * Builds one receive-capacity entry. Incoming amounts are bounded by
+ * `limit - balance - buyingLiabilities`, because open buy offers reserve
+ * room under the limit just like a settled balance does.
+ */
+function buildCapacityEntry(asset, limitStroops, balanceStroops, buyingStroops) {
+  const used = balanceStroops + buyingStroops;
+  const remaining = limitStroops > used ? limitStroops - used : 0n;
+  // Two-decimal percentage computed in integer basis points to avoid float drift.
+  const basisPoints = limitStroops > 0n ? (remaining * 10000n) / limitStroops : 0n;
+  return {
+    asset,
+    limit: stroopsToAmount(limitStroops),
+    balance: stroopsToAmount(balanceStroops),
+    remaining: stroopsToAmount(remaining),
+    remainingPercent: `${basisPoints / 100n}.${(basisPoints % 100n).toString().padStart(2, "0")}`,
+  };
+}
+
+/**
+ * GET /account/:id/receive-capacity
+ *
+ * Reports how much more of each held asset the account can receive before
+ * hitting its trustline limit, so wallets can warn a sender up front.
+ *
+ * Native XLM has no trustline, so its limit is the protocol ceiling
+ * (INT64_MAX stroops). Its entry also carries `spendableBalance` — the
+ * balance above the minimum reserve and selling liabilities.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, capacity: [{ asset, limit, balance, remaining, remainingPercent }] } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/receive-capacity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = account.balances || [];
+
+    const capacity = [];
+
+    const native = balances.find((b) => isNativeAsset(b));
+    if (native) {
+      const BASE_RESERVE_STROOPS = 5_000_000n;
+      const subentries = BigInt(account.subentry_count || 0);
+      const sponsoring = BigInt(account.num_sponsoring || 0);
+      const sponsored = BigInt(account.num_sponsored || 0);
+      const minimumBalance =
+        (2n + subentries + sponsoring - sponsored) * BASE_RESERVE_STROOPS;
+
+      const balance = amountToStroops(native.balance);
+      const spendable = balance - minimumBalance - amountToStroops(native.selling_liabilities);
+
+      capacity.push({
+        ...buildCapacityEntry(
+          normalizeAsset("XLM", null, "native"),
+          MAX_BALANCE_STROOPS,
+          balance,
+          amountToStroops(native.buying_liabilities),
+        ),
+        spendableBalance: stroopsToAmount(spendable > 0n ? spendable : 0n),
+      });
+    }
+
+    for (const b of balances) {
+      // Pool shares cannot be received via payments, so they are excluded.
+      if (isNativeAsset(b) || b.asset_type === "liquidity_pool_shares") continue;
+      capacity.push(
+        buildCapacityEntry(
+          normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+          amountToStroops(b.limit),
+          amountToStroops(b.balance),
+          amountToStroops(b.buying_liabilities),
+        ),
+      );
+    }
+
+    return success(res, { accountId: id, capacity });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const VELOCITY_LOOKBACK_DAYS = 30;
+/** Minimum completed days of history needed before a baseline is trusted. */
+const VELOCITY_MIN_BASELINE_DAYS = 7;
+const VELOCITY_STDDEV_THRESHOLD = 2;
+const PATH_PAYMENT_TYPES = new Set([
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+
+/**
+ * Returns the signed change (in stroops) a payment-stream record applied to
+ * the account's native XLM balance, or 0n if it did not touch native XLM.
+ *
+ * @param {Object} op - Horizon payments-endpoint record.
+ * @param {string} accountId
+ * @returns {bigint}
+ */
+function nativeBalanceDelta(op, accountId) {
+  if (op.type === "create_account") {
+    if (op.account === accountId) return amountToStroops(op.starting_balance);
+    if (op.funder === accountId) return -amountToStroops(op.starting_balance);
+    return 0n;
+  }
+
+  if (op.type !== "payment" && !PATH_PAYMENT_TYPES.has(op.type)) return 0n;
+  if (op.from === accountId && op.to === accountId) return 0n;
+
+  let delta = 0n;
+  if (op.to === accountId && op.asset_type === "native") {
+    delta += amountToStroops(op.amount);
+  }
+  if (op.from === accountId) {
+    const sentNative = PATH_PAYMENT_TYPES.has(op.type)
+      ? op.source_asset_type === "native"
+      : op.asset_type === "native";
+    if (sentNative) {
+      delta -= amountToStroops(PATH_PAYMENT_TYPES.has(op.type) ? op.source_amount : op.amount);
+    }
+  }
+  return delta;
+}
+
+/**
+ * GET /account/:id/balance-velocity
+ *
+ * Measures how fast the account's native XLM balance is moving and flags
+ * unusual activity. Payments from the last 30 days are bucketed into
+ * 24-hour windows ending now. The most recent bucket's absolute net change
+ * is the current rate; the older buckets form the historical baseline.
+ *
+ * `velocityFlag` is true when the current rate exceeds the baseline mean by
+ * more than two standard deviations. Accounts with fewer than seven days of
+ * history have no trustworthy baseline and always report `false`.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, asset, windows: { change24h, change7d, change30d },
+ *          currentRate, baseline: { sampleDays, average, standardDeviation, threshold }, velocityFlag } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/balance-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - VELOCITY_LOOKBACK_DAYS * DAY_MS;
+    const dailyNet = new Array(VELOCITY_LOOKBACK_DAYS).fill(0n);
+    let earliestSeen = null;
+    let reachedOlderHistory = false;
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("desc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        const createdAt = new Date(op.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        if (createdAt < windowStart) {
+          reachedOlderHistory = true;
+          break;
+        }
+        if (earliestSeen === null || createdAt < earliestSeen) earliestSeen = createdAt;
+        if (op.transaction_successful === false) continue;
+
+        const dayIndex = Math.min(
+          VELOCITY_LOOKBACK_DAYS - 1,
+          Math.max(0, Math.floor((now - createdAt) / DAY_MS)),
+        );
+        dailyNet[dayIndex] += nativeBalanceDelta(op, id);
+      }
+
+      if (reachedOlderHistory || records.length < 200) break;
+    }
+
+    const sumDays = (days) => dailyNet.slice(0, days).reduce((acc, v) => acc + v, 0n);
+    const windows = {
+      change24h: stroopsToAmount(sumDays(1)),
+      change7d: stroopsToAmount(sumDays(7)),
+      change30d: stroopsToAmount(sumDays(VELOCITY_LOOKBACK_DAYS)),
+    };
+
+    // Completed days of history available before the current 24h bucket.
+    // If Horizon returned anything older than the lookback window, every
+    // bucket is real data (zero-activity days included).
+    let historyDays = 0;
+    if (reachedOlderHistory) {
+      historyDays = VELOCITY_LOOKBACK_DAYS - 1;
+    } else if (earliestSeen !== null) {
+      historyDays = Math.min(
+        VELOCITY_LOOKBACK_DAYS - 1,
+        Math.floor((now - earliestSeen) / DAY_MS),
+      );
+    }
+
+    const toUnits = (stroops) => Number(stroops < 0n ? -stroops : stroops) / Number(STROOPS_PER_UNIT);
+    const currentRate = toUnits(dailyNet[0]);
+
+    let baseline = {
+      sampleDays: historyDays,
+      average: null,
+      standardDeviation: null,
+      threshold: null,
+    };
+    let velocityFlag = false;
+
+    if (historyDays >= VELOCITY_MIN_BASELINE_DAYS) {
+      const samples = dailyNet.slice(1, historyDays + 1).map(toUnits);
+      const average = samples.reduce((acc, v) => acc + v, 0) / samples.length;
+      const variance =
+        samples.reduce((acc, v) => acc + (v - average) ** 2, 0) / samples.length;
+      const standardDeviation = Math.sqrt(variance);
+      const threshold = average + VELOCITY_STDDEV_THRESHOLD * standardDeviation;
+
+      baseline = {
+        sampleDays: samples.length,
+        average: average.toFixed(7),
+        standardDeviation: standardDeviation.toFixed(7),
+        threshold: threshold.toFixed(7),
+      };
+      velocityFlag = currentRate > threshold;
+    }
+
+    return success(res, {
+      accountId: id,
+      asset: normalizeAsset("XLM", null, "native"),
+      windows,
+      currentRate: currentRate.toFixed(7),
+      baseline,
+      velocityFlag,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
 
 /**
  * GET /account/:id/volume?days=30
@@ -6025,12 +6378,129 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
   }
 });
 
+const OFFERS_SUMMARY_PAGE_SIZE = 200;
+// An account holds at most 1,000 subentries, so five full pages always cover
+// every open offer.
+const OFFERS_SUMMARY_MAX_PAGES = 5;
+const STROOPS_PER_UNIT = 10_000_000n;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Parses a Horizon decimal amount ("12.5000000") into integer stroops so that
+ * totals can be summed without floating-point drift.
+ *
+ * @param {string} amount
+ * @returns {bigint} Stroops, or 0n when the value is not a decimal amount.
+ */
+function amountToStroops(amount) {
+  const match = /^(\d+)(?:\.(\d{1,7}))?$/.exec(String(amount ?? "").trim());
+  if (!match) return 0n;
+  const [, whole, fraction = ""] = match;
+  return BigInt(whole) * STROOPS_PER_UNIT + BigInt(fraction.padEnd(7, "0"));
+}
+
+/**
+ * Formats integer stroops as a seven-decimal amount string.
+ *
+ * @param {bigint} stroops
+ * @returns {string}
+ */
+function stroopsToAmount(stroops) {
+  const whole = stroops / STROOPS_PER_UNIT;
+  const fraction = (stroops % STROOPS_PER_UNIT).toString().padStart(7, "0");
+  return `${whole}.${fraction}`;
+}
+
+/**
+ * Returns an offer's price (units of buying asset per unit of selling asset)
+ * as an exact ratio, preferring Horizon's `price_r` over the rounded decimal
+ * `price` string.
+ *
+ * @param {object} offer - Horizon offer record
+ * @returns {{ n: bigint, d: bigint }}
+ */
+function offerPriceRatio(offer) {
+  const ratio = offer.price_r;
+  if (ratio && Number(ratio.d) > 0) {
+    return { n: BigInt(ratio.n), d: BigInt(ratio.d) };
+  }
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(String(offer.price ?? "").trim());
+  if (!match) return { n: 0n, d: 1n };
+  const [, whole, fraction = ""] = match;
+  return { n: BigInt(whole + fraction), d: 10n ** BigInt(fraction.length) };
+}
+
+/**
+ * Adds `stroops` to the running total for `asset`, keyed by code and issuer.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @param {{ code: string, issuer: string|null }} asset
+ * @param {bigint} stroops
+ */
+function addAssetTotal(totals, asset, stroops) {
+  const key = `${asset.code}:${asset.issuer}`;
+  const entry = totals.get(key);
+  if (entry) {
+    entry.stroops += stroops;
+  } else {
+    totals.set(key, { asset, stroops });
+  }
+}
+
+/**
+ * Converts per-asset stroop totals to response entries, largest first.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @returns {Array<{ asset: object, totalAmount: string }>}
+ */
+function formatAssetTotals(totals) {
+  return Array.from(totals.values())
+    .sort((a, b) => (a.stroops === b.stroops ? 0 : a.stroops > b.stroops ? -1 : 1))
+    .map(({ asset, stroops }) => ({ asset, totalAmount: stroopsToAmount(stroops) }));
+}
+
+/**
+ * Fetches every open offer for an account, following Horizon pagination.
+ *
+ * @param {import('express').Request} req
+ * @param {string} accountId
+ * @returns {Promise<object[]>}
+ */
+async function fetchAllOffers(req, accountId) {
+  const offers = [];
+  let cursor;
+
+  for (let page = 0; page < OFFERS_SUMMARY_MAX_PAGES; page++) {
+    let query = server
+      .offers()
+      .forAccount(accountId)
+      .limit(OFFERS_SUMMARY_PAGE_SIZE)
+      .order("asc");
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    offers.push(...records);
+
+    if (records.length < OFFERS_SUMMARY_PAGE_SIZE) break;
+    cursor = records[records.length - 1].paging_token;
+  }
+
+  return offers;
+}
+
 /**
  * GET /account/:id/offers-summary
  *
- * Aggregates an account's open DEX offers per asset: total amount locked on
- * the selling side and total amount committed on the buying side, plus the
- * age of the oldest offer.
+ * A quick overview of an account's DEX position without fetching and parsing
+ * the full offers list:
+ *   - sellLocked:   per selling asset, the total amount offered for sale
+ *   - buyCommitted: per buying asset, the total amount the account will
+ *                   receive if every offer fills (amount × price)
+ *
+ * oldestOfferAgeDays is measured from each offer's `last_modified_time`;
+ * Horizon does not expose a creation time, so updating an offer resets its
+ * age. It is null when the account has no open offers.
  *
  * Responses are cached per account (X-Cache: HIT | MISS). Pass ?fresh=true
  * to bypass the cache.
@@ -6038,10 +6508,15 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
  * Response shape:
  *   {
  *     accountId: string,
- *     offerCount: number,
- *     assets: [{ asset, sellLocked, buyCommitted }],  // seven-decimal strings
+ *     totalOffers: number,
+ *     sellLocked:   [{ asset, totalAmount }],  // seven-decimal strings, largest first
+ *     buyCommitted: [{ asset, totalAmount }],  // seven-decimal strings, largest first
  *     oldestOfferAgeDays: number | null
  *   }
+ *
+ * Errors:
+ *   400 — invalid account ID
+ *   404 — account does not exist
  *
  * @example
  * GET /account/GABC.../offers-summary
@@ -6062,42 +6537,35 @@ router.get("/:id/offers-summary", async (req, res, next) => {
       }
     }
 
-    await withHorizonTiming(req, () => server.loadAccount(id));
+    // loadAccount rejects with a Horizon 404 for unknown accounts, which
+    // handleAccountNotFound turns into a structured AccountNotFound error.
+    const [, offers] = await Promise.all([
+      withHorizonTiming(req, () => server.loadAccount(id)),
+      fetchAllOffers(req, id),
+    ]);
 
-    const offersResponse = await server
-      .offers()
-      .forAccount(id)
-      .limit(200)
-      .order("desc")
-      .call();
-    const records = offersResponse.records || [];
-
-    const assetTotals = new Map();
-    const getEntry = (code, issuer, type) => {
-      const asset = normalizeAsset(code, issuer, type);
-      const key = `${asset.code}:${asset.issuer}`;
-      if (!assetTotals.has(key)) {
-        assetTotals.set(key, { asset, sellLocked: 0, buyCommitted: 0 });
-      }
-      return assetTotals.get(key);
-    };
-
+    const sellTotals = new Map();
+    const buyTotals = new Map();
     let oldestOfferTime = null;
-    for (const offer of records) {
-      const amount = parseFloat(offer.amount || "0");
-      const price = parseFloat(offer.price || "0");
 
-      getEntry(
-        offer.selling_asset_code,
-        offer.selling_asset_issuer,
-        offer.selling_asset_type,
-      ).sellLocked += amount;
-      getEntry(
-        offer.buying_asset_code,
-        offer.buying_asset_issuer,
-        offer.buying_asset_type,
-      ).buyCommitted += amount * price;
+    for (const offer of offers) {
+      const amountStroops = amountToStroops(offer.amount);
+      const { n, d } = offerPriceRatio(offer);
+      // amount × n / d, rounded half-up to the nearest stroop
+      const committedStroops = (amountStroops * n * 2n + d) / (2n * d);
 
+      addAssetTotal(
+        sellTotals,
+        normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+        amountStroops,
+      );
+      addAssetTotal(
+        buyTotals,
+        normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        committedStroops,
+      );
+
+      // new Date(null) is the epoch, not NaN, so a missing time must be skipped explicitly.
       const modified = offer.last_modified_time
         ? new Date(offer.last_modified_time).getTime()
         : NaN;
@@ -6108,16 +6576,13 @@ router.get("/:id/offers-summary", async (req, res, next) => {
 
     const data = {
       accountId: id,
-      offerCount: records.length,
-      assets: Array.from(assetTotals.values()).map((entry) => ({
-        asset: entry.asset,
-        sellLocked: toSevenDecimalString(entry.sellLocked),
-        buyCommitted: toSevenDecimalString(entry.buyCommitted),
-      })),
+      totalOffers: offers.length,
+      sellLocked: formatAssetTotals(sellTotals),
+      buyCommitted: formatAssetTotals(buyTotals),
       oldestOfferAgeDays:
         oldestOfferTime === null
           ? null
-          : Math.floor((Date.now() - oldestOfferTime) / (1000 * 60 * 60 * 24)),
+          : Math.floor((Date.now() - oldestOfferTime) / MS_PER_DAY),
     };
 
     cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
@@ -6546,6 +7011,524 @@ router.get("/:id/smart-contract-interactions", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/fee-spending
+ *
+ * Aggregates network fees paid by an account over a specified time period.
+ * Returns total fees in stroops and XLM, average fee per transaction, and a
+ * breakdown by operation type.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30) — how many days of history to analyze
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId,
+ *       period: { days, startDate, endDate },
+ *       totalFeesStroops: "123456",
+ *       totalFeesXLM: "0.0123456",
+ *       averageFeeXLM: "0.0001000",
+ *       transactionCount: 123,
+ *       breakdown: [
+ *         { operationType: "payment", count: 50, totalFeesXLM: "0.0050000" },
+ *         { operationType: "manage_offer", count: 30, totalFeesXLM: "0.0030000" },
+ *         ...
+ *       ]
+ *     }
+ *   }
+ *
+ * Errors:
+ *   - 400: InvalidParameter — days is not a valid integer or out of range
+ *   - 404: AccountNotFound — account does not exist on the network
+ *
+ * @example
+ * GET /account/GABC.../fee-spending?days=7
+ */
+router.get("/:id/fee-spending", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Validate days parameter
+    const rawDays = req.query.days;
+    let days = 30;
+    if (rawDays !== undefined) {
+      const parsed = Number(rawDays);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 90) {
+        const err = new Error("Parameter 'days' must be an integer between 1 and 90.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "days";
+        err.receivedValue = rawDays;
+        throw err;
+      }
+      days = parsed;
+    }
+
+    // Verify account exists
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - (days * 24 * 60 * 60 * 1000);
+    const startDate = new Date(windowStart).toISOString();
+    const endDate = new Date(now).toISOString();
+
+    let totalFeesStroops = 0n;
+    let transactionCount = 0;
+    const breakdownMap = new Map(); // operationType -> { count, totalFees }
+    let cursor;
+
+    // Paginate through transactions
+    for (;;) {
+      let query = server
+        .transactions()
+        .forAccount(id)
+        .limit(200)
+        .order("desc");
+      
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      if (records.length === 0) break;
+
+      for (const tx of records) {
+        const createdAt = new Date(tx.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        
+        // Stop if we've gone past the time window
+        if (createdAt < windowStart) {
+          cursor = null; // Signal we're done
+          break;
+        }
+
+        cursor = tx.paging_token;
+
+        // Only count successful transactions
+        if (tx.successful !== true) continue;
+
+        const fee = BigInt(tx.fee_charged || tx.max_fee || 0);
+        totalFeesStroops += fee;
+        transactionCount++;
+
+        // Get operation details for this transaction
+        try {
+          const opResponse = await withHorizonTiming(req, () =>
+            server.operations().forTransaction(tx.id).limit(200).call()
+          );
+
+          for (const op of opResponse.records || []) {
+            const opType = op.type || "unknown";
+            const existing = breakdownMap.get(opType) || { count: 0, totalFees: 0n };
+            existing.count++;
+            // Distribute the transaction fee evenly across operations
+            existing.totalFees += fee / BigInt(tx.operation_count || 1);
+            breakdownMap.set(opType, existing);
+          }
+        } catch (opErr) {
+          // If we can't get operations, just continue (edge case)
+          console.error(`Failed to fetch operations for tx ${tx.id}:`, opErr.message);
+        }
+      }
+
+      // If cursor is null, we've processed all relevant transactions
+      if (!cursor || records.length < 200) break;
+    }
+
+    // Convert breakdown map to array
+    const breakdown = Array.from(breakdownMap.entries())
+      .map(([operationType, data]) => ({
+        operationType,
+        count: data.count,
+        totalFeesXLM: stroopsToAmount(data.totalFees),
+      }))
+      .sort((a, b) => b.count - a.count); // Sort by count descending
+
+    const totalFeesXLM = stroopsToAmount(totalFeesStroops);
+    const averageFeeXLM = transactionCount > 0
+      ? stroopsToAmount(totalFeesStroops / BigInt(transactionCount))
+      : "0.0000000";
+
+    return success(res, {
+      accountId: id,
+      period: {
+        days,
+        startDate,
+        endDate,
+      },
+      totalFeesStroops: totalFeesStroops.toString(),
+      totalFeesXLM,
+      averageFeeXLM,
+      transactionCount,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
 
 // SHELL_SYNC_MARKER
+
+/**
+ * Evaluates claimable balance predicate conditions
+ * @param {object} predicate - Predicate object from Horizon
+ * @param {number} currentTimeMs - Current time in milliseconds
+ * @returns {object} { predicatesMet: string[], predicatesNotMet: string[], claimableAt: string|null }
+ */
+function evaluateClaimablePredicate(predicate, currentTimeMs) {
+  const predicatesMet = [];
+  const predicatesNotMet = [];
+  let claimableAt = null;
+
+  if (!predicate) {
+    predicatesMet.push("unconditional");
+    return { predicatesMet, predicatesNotMet, claimableAt };
+  }
+
+  const type = predicate.predicate_type;
+
+  if (type === "unconditional" || type === "predicate_unconditional") {
+    predicatesMet.push("unconditional");
+    return { predicatesMet, predicatesNotMet, claimableAt };
+  }
+
+  // Handle time-based predicates
+  if (type === "predicate_left_greater" || type === "predicate_left_greater_or_equal") {
+    const timestamp = parseInt(predicate.time_bounds?.min_time || 0, 10) * 1000;
+    if (currentTimeMs > timestamp || (type === "predicate_left_greater_or_equal" && currentTimeMs >= timestamp)) {
+      predicatesMet.push(`time_lock (after ${new Date(timestamp).toISOString()})`);
+    } else {
+      predicatesNotMet.push(`time_lock (before ${new Date(timestamp).toISOString()})`);
+      claimableAt = new Date(timestamp).toISOString();
+    }
+  }
+
+  if (type === "predicate_right_less" || type === "predicate_right_less_or_equal") {
+    const timestamp = parseInt(predicate.time_bounds?.max_time || 0, 10) * 1000;
+    if (currentTimeMs < timestamp || (type === "predicate_right_less_or_equal" && currentTimeMs <= timestamp)) {
+      predicatesMet.push(`time_window_open (until ${new Date(timestamp).toISOString()})`);
+    } else {
+      predicatesNotMet.push(`time_window_closed (expired at ${new Date(timestamp).toISOString()})`);
+    }
+  }
+
+  // Handle composite predicates (and/or)
+  if (type === "predicate_and") {
+    const left = evaluateClaimablePredicate(predicate.left_predicate, currentTimeMs);
+    const right = evaluateClaimablePredicate(predicate.right_predicate, currentTimeMs);
+    predicatesMet.push(...left.predicatesMet, ...right.predicatesMet);
+    predicatesNotMet.push(...left.predicatesNotMet, ...right.predicatesNotMet);
+    if (left.claimableAt || right.claimableAt) {
+      claimableAt = new Date(Math.max(
+        new Date(left.claimableAt || 0).getTime(),
+        new Date(right.claimableAt || 0).getTime()
+      )).toISOString();
+    }
+  }
+
+  if (type === "predicate_or") {
+    const left = evaluateClaimablePredicate(predicate.left_predicate, currentTimeMs);
+    const right = evaluateClaimablePredicate(predicate.right_predicate, currentTimeMs);
+    // For OR, if either side is eligible, it's eligible
+    const leftEligible = left.predicatesNotMet.length === 0;
+    const rightEligible = right.predicatesNotMet.length === 0;
+    if (leftEligible || rightEligible) {
+      predicatesMet.push(...(leftEligible ? left.predicatesMet : right.predicatesMet));
+    } else {
+      predicatesNotMet.push(...left.predicatesNotMet, ...right.predicatesNotMet);
+      claimableAt = new Date(Math.min(
+        new Date(left.claimableAt || Date.now()).getTime(),
+        new Date(right.claimableAt || Date.now()).getTime()
+      )).toISOString();
+    }
+  }
+
+  return { predicatesMet, predicatesNotMet, claimableAt };
+}
+
+/**
+ * GET /account/:id/claimable-balance-eligibility
+ *
+ * Returns detailed eligibility breakdown for each claimable balance sponsored to the account.
+ * For each balance, explains which predicate conditions are met, which are not, and when
+ * a time-locked balance becomes claimable.
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: <string>,
+ *       balances: [
+ *         {
+ *           balanceId: <string>,
+ *           asset: <string>,
+ *           amount: <string>,
+ *           isEligible: <boolean>,
+ *           predicatesMet: <string[]>,
+ *           predicatesNotMet: <string[]>,
+ *           claimableAt: <ISO8601 string or null>
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns 404 if the account does not exist.
+ *
+ * @example
+ * GET /account/GBRPYHIL2CI3WHZDTOOQFC6EB4CGQG5N3KBI5DOMMZMDBESIOXW32DT/claimable-balance-eligibility
+ */
+router.get("/:id/claimable-balance-eligibility", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Validate account ID
+    const accountIdError = validateAccountId(id);
+    if (accountIdError) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: accountIdError,
+        },
+      });
+    }
+
+    // Check if account exists
+    let account;
+    try {
+      account = await withHorizonTiming(req, () => server.accounts().accountId(id).call());
+    } catch (err) {
+      if (err.status === 404) {
+        return res.status(404).json(makeAccountNotFoundError(id));
+      }
+      throw err;
+    }
+
+    // Fetch claimable balances sponsored to this account
+    const cbResponse = await withHorizonTiming(req, () =>
+      server
+        .claimableBalances()
+        .claimant(id)
+        .order("desc")
+        .limit(200)
+        .call()
+    );
+
+    const balances = (cbResponse.records || []).map((cb) => {
+      const currentTimeMs = Date.now();
+      const { predicatesMet, predicatesNotMet, claimableAt } = evaluateClaimablePredicate(
+        cb.predicate,
+        currentTimeMs
+      );
+
+      // Determine if eligible (no unsatisfied predicates)
+      const isEligible = predicatesNotMet.length === 0;
+
+      // Format asset
+      let assetString;
+      if (cb.asset === "native") {
+        assetString = "XLM";
+      } else {
+        const [code, issuer] = cb.asset.split(":");
+        assetString = `${code}:${issuer}`;
+      }
+
+      return {
+        balanceId: cb.id,
+        asset: assetString,
+        amount: cb.amount,
+        isEligible,
+        predicatesMet,
+        predicatesNotMet,
+        claimableAt: isEligible ? null : claimableAt,
+      };
+    });
+
+    const data = {
+      accountId: id,
+      balances,
+    };
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /account/:id/balance-velocity
+ *
+ * Analyzes the rate of change in an account's balances over rolling time windows.
+ * Tracks how much each asset balance has changed in the last hour, 24 hours, and 7 days.
+ * Sets a velocityFlag when the change rate exceeds two standard deviations from the
+ * account's historical average (indicating unusual activity).
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: <string>,
+ *       balanceChanges: [
+ *         {
+ *           asset: <string>,
+ *           change1h: <string (7 decimals)>,
+ *           change24h: <string (7 decimals)>,
+ *           change7d: <string (7 decimals)>,
+ *           velocityFlag: <boolean>
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * All change values are formatted as seven-decimal strings and can be negative.
+ * velocityFlag is true when |change| > μ + 2σ from historical daily changes.
+ * Returns 404 if the account does not exist.
+ *
+ * @example
+ * GET /account/GBRPYHIL2CI3WHZDTOOQFC6EB4CGQG5N3KBI5DOMMZMDBESIOXW32DT/balance-velocity
+ */
+router.get("/:id/balance-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Validate account ID
+    const accountIdError = validateAccountId(id);
+    if (accountIdError) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: accountIdError,
+        },
+      });
+    }
+
+    // Check if account exists and get current balances
+    let account;
+    try {
+      account = await withHorizonTiming(req, () => server.accounts().accountId(id).call());
+    } catch (err) {
+      if (err.status === 404) {
+        return res.status(404).json(makeAccountNotFoundError(id));
+      }
+      throw err;
+    }
+
+    const currentBalances = {};
+    
+    // Build map of current balances
+    account.balances.forEach((balance) => {
+      if (balance.asset_type === "native") {
+        currentBalances["XLM"] = parseFloat(balance.balance);
+      } else {
+        const key = `${balance.asset_code}:${balance.asset_issuer}`;
+        currentBalances[key] = parseFloat(balance.balance);
+      }
+    });
+
+    // Fetch payment operations to analyze balance changes
+    const now = Date.now();
+    const timeWindows = {
+      "1h": now - 60 * 60 * 1000,
+      "24h": now - 24 * 60 * 60 * 1000,
+      "7d": now - 7 * 24 * 60 * 60 * 1000,
+    };
+
+    // Fetch payment and path_payment operations
+    const paymentsResponse = await withHorizonTiming(req, () =>
+      server
+        .payments()
+        .forAccount(id)
+        .order("desc")
+        .limit(200)
+        .call()
+    );
+
+    const payments = paymentsResponse.records || [];
+    const balanceChanges = {};
+
+    // Calculate balance changes by asset
+    payments.forEach((payment) => {
+      const operationTimestamp = new Date(payment.created_at).getTime();
+      
+      // Determine asset key
+      let assetKey;
+      if (payment.asset_type === "native" || payment.asset_code === "XLM") {
+        assetKey = "XLM";
+      } else {
+        assetKey = `${payment.asset_code}:${payment.asset_issuer}`;
+      }
+
+      // Initialize asset tracking if needed
+      if (!balanceChanges[assetKey]) {
+        balanceChanges[assetKey] = {
+          change1h: 0,
+          change24h: 0,
+          change7d: 0,
+          dailyChanges: [],
+        };
+      }
+
+      const amount = parseFloat(payment.amount);
+      const isReceived = payment.to === id;
+      const change = isReceived ? amount : -amount;
+
+      // Record by time window
+      if (operationTimestamp > timeWindows["1h"]) {
+        balanceChanges[assetKey].change1h += change;
+      }
+      if (operationTimestamp > timeWindows["24h"]) {
+        balanceChanges[assetKey].change24h += change;
+      }
+      if (operationTimestamp > timeWindows["7d"]) {
+        balanceChanges[assetKey].change7d += change;
+        
+        // Track daily change for velocity calculation
+        const dayIndex = Math.floor((now - operationTimestamp) / (24 * 60 * 60 * 1000));
+        if (!balanceChanges[assetKey].dailyChanges[dayIndex]) {
+          balanceChanges[assetKey].dailyChanges[dayIndex] = 0;
+        }
+        balanceChanges[assetKey].dailyChanges[dayIndex] += change;
+      }
+    });
+
+    // Calculate velocity flags
+    const result = Object.entries(balanceChanges).map(([asset, changes]) => {
+      // Compute historical statistics
+      const dailyChanges = changes.dailyChanges.filter((c) => c !== undefined);
+      let velocityFlag = false;
+
+      if (dailyChanges.length > 1) {
+        const mean = dailyChanges.reduce((a, b) => a + b, 0) / dailyChanges.length;
+        const variance = dailyChanges.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / dailyChanges.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Check if any recent change exceeds mean + 2σ
+        const recentChange = changes.change24h;
+        velocityFlag = Math.abs(recentChange - mean) > 2 * stdDev;
+      }
+
+      return {
+        asset,
+        change1h: changes.change1h.toFixed(7),
+        change24h: changes.change24h.toFixed(7),
+        change7d: changes.change7d.toFixed(7),
+        velocityFlag,
+      };
+    });
+
+    const data = {
+      accountId: id,
+      balanceChanges: result,
+    };
+
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});

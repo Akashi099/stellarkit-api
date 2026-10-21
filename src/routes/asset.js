@@ -834,6 +834,187 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
 });
 
 /**
+ * Resolution map for the holder-growth time series.
+ *
+ * Each resolution defines a look-back window (`windowMs`) and a bucket size
+ * (`bucketMs`). Trustline operations are grouped into buckets of `bucketMs`
+ * and ordered oldest-first; `holders` is the cumulative net change since the
+ * start of the window.
+ *
+ * - 7d  — 7-day window,   daily buckets   (fine-grained recent growth)
+ * - 30d — 30-day window, weekly buckets  (month-over-month growth, default)
+ * - 90d — 90-day window, weekly buckets  (quarterly growth trend)
+ */
+const HOLDER_GROWTH_RESOLUTIONS = {
+  "7d": { windowMs: 7 * 24 * 60 * 60 * 1000, bucketMs: 24 * 60 * 60 * 1000 },
+  "30d": { windowMs: 30 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+  "90d": { windowMs: 90 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+};
+
+/**
+ * Buckets change_trust operations into a holder-growth time series.
+ *
+ * A change_trust operation with `limit > 0` creates a trustline (+1 holder);
+ * a change_trust with `limit === 0` removes one (-1 holder). Operations that
+ * fall before `windowStartMs` are excluded. Buckets are returned oldest-first
+ * with a running `holders` total so each entry describes the net growth at
+ * that point in time.
+ *
+ * @param {Array<Object>} operations - change_trust records from Horizon.
+ * @param {number} windowStartMs - Unix-ms cutoff; earlier ops are ignored.
+ * @param {number} bucketMs - Width of each time bucket in milliseconds.
+ * @returns {Array<{date: string, holders: number, change: number, added: number, removed: number}>}
+ */
+function aggregateTrustlineGrowth(operations, windowStartMs, bucketMs) {
+  const buckets = new Map();
+
+  for (const op of operations) {
+    const opTime = new Date(op.created_at).getTime();
+    if (!Number.isFinite(opTime) || opTime < windowStartMs) {
+      continue;
+    }
+
+    const bucketStart = Math.floor(opTime / bucketMs) * bucketMs;
+    if (!buckets.has(bucketStart)) {
+      buckets.set(bucketStart, {
+        bucketStart,
+        date: new Date(bucketStart).toISOString(),
+        change: 0,
+        added: 0,
+        removed: 0,
+      });
+    }
+
+    const bucket = buckets.get(bucketStart);
+    if (parseFloat(op.limit) > 0) {
+      bucket.change += 1;
+      bucket.added += 1;
+    } else {
+      bucket.change -= 1;
+      bucket.removed += 1;
+    }
+  }
+
+  const sorted = Array.from(buckets.values()).sort(
+    (a, b) => a.bucketStart - b.bucketStart,
+  );
+
+  let cumulativeHolders = 0;
+  return sorted.map((bucket) => {
+    cumulativeHolders += bucket.change;
+    return {
+      date: bucket.date,
+      holders: cumulativeHolders,
+      change: bucket.change,
+      added: bucket.added,
+      removed: bucket.removed,
+    };
+  });
+}
+
+/**
+ * GET /asset/:code/:issuer/holder-growth
+ *
+ * Returns a holder-growth time series built from trustline (change_trust)
+ * operation history. Each entry covers one time bucket (sized by the
+ * resolution) and reports the net change in holders within that bucket plus
+ * the cumulative holder count since the start of the window.
+ *
+ * @param {string} code - Asset code, e.g. USDC
+ * @param {string} issuer - Asset issuer account ID (G...)
+ * @param {string} [resolution=30d] - Time resolution: 7d, 30d, or 90d.
+ * @param {string} [fresh] - Bypass cache when "true".
+ * @returns {Object} `{ growth: Array, asset: Object, resolution: string }`
+ * @example
+ * curl "http://localhost:3000/asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/holder-growth?resolution=30d"
+ */
+router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const asset = new Asset(assetCode, issuer);
+    const resolution = req.query.resolution || "30d";
+
+    const resolutions = { "7d": 7, "30d": 30, "90d": 90 };
+    const days = resolutions[resolution] || 30;
+    const windowStartMs = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    let cursor;
+    const growth = [];
+    let cumulativeHolders = 0;
+    const holderCounts = new Map();
+
+    while (true) {
+      let query = server
+        .effects()
+        .forAsset(asset)
+        .order("asc")
+        .limit(200);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await query.call();
+      const records = response.records || [];
+      if (records.length === 0) break;
+
+      for (const effect of records) {
+        cursor = effect.paging_token;
+        if (effect.type !== "trustline_flags_updated") continue;
+        if (effect.asset_issuer !== issuer || effect.asset_code !== assetCode)
+          continue;
+
+        const timestamp = new Date(effect.created_at).getTime();
+        if (!Number.isFinite(timestamp)) continue;
+        if (timestamp < windowStartMs) continue;
+
+        const isAuthorized = effect.new_flags?.authorized === true;
+        const isClawbackEnabled = effect.new_flags?.clawback_enabled === true;
+        const flagsChanged =
+          (effect.new_flags?.authorized !== effect.old_flags?.authorized ||
+            effect.new_flags?.clawback_enabled !==
+              effect.old_flags?.clawback_enabled) ??
+          false;
+
+        if (!isAuthorized && !isClawbackEnabled) cumulativeHolders--;
+        else if (flagsChanged && isAuthorized && !holderCounts.has("add"))
+          cumulativeHolders++;
+
+        const bucketKey = Math.floor(timestamp / (days * 24 * 60 * 60 * 1000));
+        if (!holderCounts.has(bucketKey)) {
+          holderCounts.set(bucketKey, { added: 0, removed: 0 });
+        }
+        const bucket = holderCounts.get(bucketKey);
+        if (!isAuthorized) bucket.removed++;
+        else bucket.added++;
+      }
+
+      if (!response.records?.[response.records.length - 1]?.paging_token)
+        break;
+    }
+
+    const sortedBuckets = Array.from(holderCounts.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([bucket, data]) => ({
+        timestamp: new Date(bucket * days * 24 * 60 * 60 * 1000).toISOString(),
+        change: data.added - data.removed,
+        holders: cumulativeHolders,
+      }));
+
+    return success(res, {
+      asset: { code: assetCode, issuer, type: "credit_alphanum4" },
+      resolution,
+      growth: sortedBuckets,
+    });
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return next(makeAssetNotFoundError(code, issuer, NETWORK));
+    }
+    next(err);
+  }
+});
+
+/**
  * GET /asset/:code/:issuer/trading-volume
  *
  * Returns the asset's traded volume, trade count, and distinct traders over
@@ -1161,7 +1342,7 @@ function aggregateTrustlineGrowth(operations, windowStartMs, bucketMs) {
  * @example
  * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/holder-growth?resolution=7d
  */
-router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
+router.get("/:code/:issuer/issuance-history", async (req, res, next) => {
   try {
     const { code, issuer } = req.params;
     validateAsset(code, issuer);
@@ -1169,19 +1350,18 @@ router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
     const assetCode = code.toUpperCase();
     const resolution = req.query.resolution || "30d";
 
-    if (!HOLDER_GROWTH_RESOLUTIONS[resolution]) {
-      return res.status(400).json({
-        success: false,
-        error: {
-          type: "ValidationError",
-          message: `Invalid resolution "${resolution}". Accepted values are: ${Object.keys(HOLDER_GROWTH_RESOLUTIONS).join(", ")}.`,
-          field: "resolution",
-          receivedValue: String(resolution),
-          expectedFormat: Object.keys(HOLDER_GROWTH_RESOLUTIONS).join(" | "),
-        },
-      });
+const validResolutions = ["7d", "30d", "90d"];
+    if (!validResolutions.includes(resolution)) {
+      const err = new Error(`Invalid resolution "${resolution}". Valid options are: ${validResolutions.join(", ")}.`);
+      err.isValidation = true;
+      err.status = 400;
+      err.field = "resolution";
+      err.receivedValue = resolution;
+      err.expectedFormat = validResolutions.join(", ");
+      throw err;
     }
 
+    const cacheKey = `asset-issuance-history:${assetCode}:${issuer}:${resolution}`;
     const fresh = isFreshRequest(req.query);
     const cacheKey = `asset-holder-growth:${assetCode}:${issuer}:${resolution}`;
 
@@ -1193,7 +1373,7 @@ router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
       }
     }
 
-    // 404 guard — verify the asset exists before spending time on operations
+    // Verify asset exists
     const assetsResponse = await server
       .assets()
       .forCode(assetCode)
@@ -1204,38 +1384,261 @@ router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
       throw makeAssetNotFoundError(assetCode, issuer, NETWORK);
     }
 
-    const { windowMs, bucketMs } = HOLDER_GROWTH_RESOLUTIONS[resolution];
-    const windowStartMs = Date.now() - windowMs;
+    const asset = assetsResponse.records[0];
+    const currentSupply = asset.amount;
 
-    // Fetch recent change_trust operations for this asset.
-    // We query against the issuer account and filter client-side for this
-    // specific asset because Horizon does not support filtering operations by
-    // asset code + issuer together.
-    const operationsResponse = await server
-      .operations()
+    // Calculate time window
+    const now = Date.now();
+    const daysMap = { "7d": 7, "30d": 30, "90d": 90 };
+    const days = daysMap[resolution];
+    const startTime = now - (days * 24 * 60 * 60 * 1000);
+
+    // Fetch effects related to issuance (payments from issuer, trust line changes)
+    const effectsResponse = await server
+      .effects()
       .forAccount(issuer)
       .order("desc")
       .limit(200)
       .call();
 
-    const records = (operationsResponse.records || []).filter(
-      (op) =>
-        op.type === "change_trust" &&
-        op.asset_code === assetCode &&
-        op.asset_issuer === issuer,
-    );
+    // Aggregate issuance data
+    const issuanceMap = new Map();
+    
+    for (const effect of effectsResponse.records || []) {
+      const timestamp = new Date(effect.created_at).getTime();
+      if (!Number.isFinite(timestamp) || timestamp < startTime) continue;
+      
+      const bucketKey = Math.floor(timestamp / (days * 24 * 60 * 60 * 1000));
+      if (!issuanceMap.has(bucketKey)) {
+        issuanceMap.set(bucketKey, { issued: 0, revoked: 0, transactions: 0 });
+      }
+      const bucket = issuanceMap.get(bucketKey);
+      
+      if (effect.type === "payment" && effect.to === issuer) {
+        bucket.issued += parseFloat(effect.amount || 0);
+        bucket.transactions += 1;
+      } else if (effect.type === "clawback" && effect.from === issuer) {
+        bucket.revoked += parseFloat(effect.amount || 0);
+        bucket.transactions += 1;
+      }
+    }
 
-    const growth = aggregateTrustlineGrowth(records, windowStartMs, bucketMs);
+    const sortedBuckets = Array.from(issuanceMap.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([bucket, data]) => ({
+        timestamp: new Date(bucket * days * 24 * 60 * 60 * 1000).toISOString(),
+        issued: data.issued.toFixed(7),
+        revoked: data.revoked.toFixed(7),
+        transactions: data.transactions,
+      }));
 
     const data = {
-      code: assetCode,
-      issuer,
+      issuance: sortedBuckets,
+      currentSupply,
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
       resolution,
       growth,
     };
 
-    cacheService.set(cacheKey, data, cacheTTL.assetHolderGrowth);
+    cacheService.set(cacheKey, data, cacheTTL.asset);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
 
+/**
+ * GET /asset/:code/:issuer/price-history
+ *
+ * Returns historical price data for an asset (quoted in XLM) as a time series
+ * of OHLC (open-high-low-close) candles derived from DEX trades.
+ *
+ * Query params:
+ *   - resolution (string, default: "24h") — candle interval: "1h", "24h", "7d"
+ *   - limit (integer, 1–100, default: 50) — maximum number of candles to return
+ *   - fresh (boolean, default: false) — bypass cache when set to "true"
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       asset: { code, issuer, type },
+ *       quoteAsset: "XLM",
+ *       resolution,
+ *       candles: [
+ *         {
+ *           timestamp,
+ *           open: "0.1234567",
+ *           high: "0.1345678",
+ *           low: "0.1123456",
+ *           close: "0.1287654",
+ *           volume: "1234.5678900",
+ *           trades: 42
+ *         },
+ *         ...
+ *       ]
+ *     }
+ *   }
+ *
+ * Errors:
+ *   - 400: ValidationError — invalid asset format, resolution, or limit
+ *   - 404: AssetNotFound — asset does not exist
+ *
+ * @example
+ * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/price-history?resolution=1h&limit=24
+ */
+router.get("/:code/:issuer/price-history", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+
+    // Validate resolution parameter
+    const validResolutions = ["1h", "24h", "7d"];
+    const resolution = req.query.resolution || "24h";
+    
+    if (!validResolutions.includes(resolution)) {
+      const err = new Error(
+        `Invalid resolution "${resolution}". Valid options are: ${validResolutions.join(", ")}`
+      );
+      err.isValidation = true;
+      err.status = 400;
+      err.field = "resolution";
+      err.receivedValue = resolution;
+      err.expectedFormat = validResolutions.join(", ");
+      throw err;
+    }
+
+    // Validate limit parameter
+    const rawLimit = req.query.limit;
+    let limit = 50;
+    if (rawLimit !== undefined) {
+      const parsed = Number(rawLimit);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+        const err = new Error("Parameter 'limit' must be an integer between 1 and 100.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "limit";
+        err.receivedValue = rawLimit;
+        throw err;
+      }
+      limit = parsed;
+    }
+
+    const fresh = req.query.fresh === "true";
+    const cacheKey = `asset:price-history:${assetCode}:${issuer}:${resolution}:${limit}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Verify asset exists
+    const assetsResponse = await server
+      .assets()
+      .forCode(assetCode)
+      .forIssuer(issuer)
+      .limit(1)
+      .call();
+
+    if (!assetsResponse.records || assetsResponse.records.length === 0) {
+      throw makeAssetNotFoundError(assetCode, issuer, NETWORK);
+    }
+
+    // Resolution to milliseconds
+    const resolutionMs = {
+      "1h": 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+    };
+
+    const bucketMs = resolutionMs[resolution];
+    const now = Date.now();
+    const windowStart = now - (limit * bucketMs);
+
+    // Fetch trades for this asset pair
+    const asset = new Asset(assetCode, issuer);
+    const tradesResponse = await server
+      .trades()
+      .forAssetPair(asset, Asset.native())
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const trades = tradesResponse.records || [];
+
+    // If no trades, return empty candles array
+    if (trades.length === 0) {
+      const data = {
+        asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+        quoteAsset: "XLM",
+        resolution,
+        candles: [],
+      };
+      cacheService.set(cacheKey, data, cacheTTL.assetPrice);
+      res.set("X-Cache", "MISS");
+      return success(res, data);
+    }
+
+    // Group trades into buckets
+    const buckets = new Map();
+
+    for (const trade of trades) {
+      const timestamp = new Date(trade.ledger_close_time).getTime();
+      if (Number.isNaN(timestamp) || timestamp < windowStart) continue;
+
+      const bucketKey = Math.floor(timestamp / bucketMs) * bucketMs;
+      
+      if (!buckets.has(bucketKey)) {
+        buckets.set(bucketKey, {
+          trades: [],
+          volume: 0,
+        });
+      }
+
+      const bucket = buckets.get(bucketKey);
+      const price = parseFloat(trade.price?.n || 0) / parseFloat(trade.price?.d || 1);
+      const amount = parseFloat(trade.base_amount || 0);
+
+      bucket.trades.push(price);
+      bucket.volume += amount;
+    }
+
+    // Convert buckets to OHLC candles
+    const candles = Array.from(buckets.entries())
+      .map(([timestamp, bucket]) => {
+        const prices = bucket.trades;
+        const open = prices[prices.length - 1]; // First trade in bucket (reversed)
+        const close = prices[0]; // Last trade in bucket
+        const high = Math.max(...prices);
+        const low = Math.min(...prices);
+
+        return {
+          timestamp: new Date(timestamp).toISOString(),
+          open: open.toFixed(7),
+          high: high.toFixed(7),
+          low: low.toFixed(7),
+          close: close.toFixed(7),
+          volume: bucket.volume.toFixed(7),
+          trades: prices.length,
+        };
+      })
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+      .slice(-limit); // Take only the requested number of candles
+
+    const data = {
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+      quoteAsset: "XLM",
+      resolution,
+      candles,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.assetPrice);
     res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
@@ -1244,3 +1647,4 @@ router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
 });
 
 module.exports = router;
+

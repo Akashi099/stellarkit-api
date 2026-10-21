@@ -19,10 +19,8 @@
  *   CACHE_TTL_FREEZE_CHECK_MS   — /account/:id/freeze-status     (default: 30 000 ms)
  *   CACHE_TTL_BALANCES_BY_SPONSOR_MS — /claimable-balances/by-sponsor (default: 30 000 ms)
  *   CACHE_TTL_FREEZE_CHECK_MS   — /account/:id/freeze-status     (default: 30 000 ms)
- *   CACHE_TTL_SIGNING_KEYS_MS         — /account/:id/signing-keys      (default: 20 000 ms)
- *   CACHE_TTL_ASSET_TOML_MS           — /asset/:code/:issuer/toml       (default: 300 000 ms)
- *   CACHE_TTL_ASSET_TOP_TRADERS_MS    — /asset/:code/:issuer/top-traders (default: 300 000 ms)
- *   CACHE_TTL_ASSET_HOLDER_GROWTH_MS  — /asset/:code/:issuer/holder-growth (default: 300 000 ms)
+ *   CACHE_TTL_SIGNING_KEYS_MS   — /account/:id/signing-keys      (default: 20 000 ms)
+ *   CACHE_TTL_SOROBAN_STATS_MS  — /network/soroban-stats         (default: 60 000 ms)
  *
  * The legacy CACHE_TTL_MS variable is still respected as a global fallback so
  * existing deployments are not broken.
@@ -180,22 +178,10 @@ const cacheTTL = {
     60000
   ),
 
-  /** /asset/:code/:issuer/toml — stellar.toml metadata, 5 min default */
-  toml: msToSeconds(
-    process.env.CACHE_TTL_ASSET_TOML_MS,
-    300000
-  ),
-
-  /** /asset/:code/:issuer/top-traders — 24h trading leaderboard, 5 min default */
-  assetTopTraders: msToSeconds(
-    process.env.CACHE_TTL_ASSET_TOP_TRADERS_MS,
-    300000
-  ),
-
-  /** /asset/:code/:issuer/holder-growth — trustline growth time series, 5 min default */
-  assetHolderGrowth: msToSeconds(
-    process.env.CACHE_TTL_ASSET_HOLDER_GROWTH_MS,
-    300000
+  /** /network/soroban-stats — scans up to 2,000 operations, so cache for 60 s */
+  sorobanStats: msToSeconds(
+    process.env.CACHE_TTL_SOROBAN_STATS_MS,
+    60000
   ),
 };
 
